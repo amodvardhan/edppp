@@ -93,7 +93,7 @@ export const projectsApi = {
 
 export interface SprintPlanRowApi {
   id: string;
-  type: "sprint-week" | "phase";
+  type: "sprint-week" | "sprint" | "phase";
   sprint_num?: number;
   week_num?: number;
   phase?: "pre_uat" | "uat" | "go_live";
@@ -119,7 +119,7 @@ function toApiRow(r: { id: string; type: string; sprintNum?: number; weekNum?: n
 function fromApiRow(r: SprintPlanRowApi) {
   return {
     id: r.id,
-    type: r.type as "sprint-week" | "phase",
+    type: r.type as "sprint-week" | "sprint" | "phase",
     sprintNum: r.sprint_num,
     weekNum: r.week_num,
     phase: r.phase as "pre_uat" | "uat" | "go_live" | undefined,

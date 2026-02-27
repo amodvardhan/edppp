@@ -151,7 +151,7 @@ async def add_feature(
 
 async def _get_bu_role_names(db: AsyncSession) -> list[str]:
     result = await db.execute(select(RoleDefaultRate.role).order_by(RoleDefaultRate.role))
-    return [r[0] for r in result.all()]
+    return [str(r[0]).strip() for r in result.all() if r[0]]
 
 
 @router.post("/{project_id}/features/ai-estimate", response_model=AIEstimateResponse)
@@ -269,6 +269,24 @@ async def update_feature(
             ))
     if data.tasks is not None:
         feature.tasks = [{"name": t.name, "effort_hours": float(t.effort_hours), "role": t.role} for t in data.tasks]
+        # Derive effort_allocations from tasks so cost calculation uses correct roles
+        role_hours: dict[str, Decimal] = {}
+        for t in data.tasks:
+            r = (t.role or "").strip() or "Unassigned"
+            role_hours[r] = role_hours.get(r, Decimal(0)) + t.effort_hours
+        total_hrs = sum(role_hours.values()) or Decimal(1)
+        for a in list(feature.effort_allocations or []):
+            await db.delete(a)
+        for role, hrs in role_hours.items():
+            pct = (hrs / total_hrs * 100).quantize(Decimal("0.01"))
+            db.add(
+                EffortAllocation(
+                    feature_id=feature.id,
+                    role=role,
+                    allocation_pct=pct,
+                    effort_hours=hrs,
+                )
+            )
 
     db.add(AuditLog(
         project_id=project_id,

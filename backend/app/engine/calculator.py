@@ -8,6 +8,18 @@ from app.models.project import ProjectVersion, RevenueModel, SprintConfig
 from app.models.team import TeamMember
 
 
+def _task_contingency_multiplier(role: str, settings) -> Decimal:
+    """Task-level contingency by seniority from config."""
+    if not role or not role.strip():
+        return Decimal(str(settings.task_contingency_default))
+    r = role.strip().lower()
+    if "junior" in r or "jr " in r:
+        return Decimal(str(settings.task_contingency_junior))
+    if "senior" in r or "sr " in r or "lead" in r:
+        return Decimal(str(settings.task_contingency_senior))
+    return Decimal(str(settings.task_contingency_default))
+
+
 def _get_bu_rate_for_role(role: str, default_rates: dict[str, tuple[Decimal, Decimal]]) -> tuple[Decimal, Decimal]:
     """Get BU (cost, billing) rate for role. Case-insensitive lookup."""
     if not role or not role.strip():
@@ -73,8 +85,26 @@ class CalculationEngine:
         return self._round(rate / utilization)
 
     def total_effort_hours(self, features: list[Feature]) -> Decimal:
-        """Sum of all feature effort hours."""
+        """Sum of all feature effort hours (base, no contingency)."""
         return sum(f.effort_hours for f in features)
+
+    def total_effort_hours_with_task_contingency(
+        self,
+        features: list[Feature],
+        effort_allocations: dict[int, list[Any]],
+    ) -> Decimal:
+        """Sum of effort hours with task-level contingency (Jr/Sr) applied."""
+        total = Decimal(0)
+        for feature in features:
+            allocations = effort_allocations.get(feature.id, [])
+            if allocations:
+                for alloc in allocations:
+                    mult = _task_contingency_multiplier(alloc.role, self.settings)
+                    total += alloc.effort_hours * mult
+            else:
+                mult = Decimal(str(self.settings.task_contingency_default))
+                total += feature.effort_hours * mult
+        return self._round(total)
 
     def base_cost(
         self,
@@ -89,35 +119,41 @@ class CalculationEngine:
             allocations = effort_allocations.get(feature.id, [])
             if allocations:
                 for alloc in allocations:
-                    role_hours = alloc.effort_hours
+                    base_hours = alloc.effort_hours
+                    mult = _task_contingency_multiplier(alloc.role, self.settings)
+                    role_hours = base_hours * mult
                     member = next(
                         (m for m in team_members if m.role == alloc.role),
                         None,
                     )
                     if member:
                         cost_rate = _resolve_cost_rate_per_day(member, default_rates)
-                        hours_per_day = Decimal(member.hours_per_day or 8)
+                        hours_per_day = Decimal(member.hours_per_day or self.settings.default_hours_per_day)
                         util = member.utilization_pct / Decimal(100)
                         if hours_per_day > 0 and util > 0:
                             cost_per_hour = cost_rate / (hours_per_day * util)
                             total += role_hours * cost_per_hour
                     else:
                         cost_rate, _ = _get_bu_rate_for_role(alloc.role, default_rates)
-                        hours_per_day = Decimal(8)
-                        util = Decimal("0.8")
+                        hours_per_day = Decimal(self.settings.default_hours_per_day)
+                        util = Decimal(str(self.settings.default_utilization_pct / 100))
                         if cost_rate > 0 and hours_per_day > 0 and util > 0:
                             cost_per_hour = cost_rate / (hours_per_day * util)
                             total += role_hours * cost_per_hour
             else:
                 total_hours = feature.effort_hours
+                mult = Decimal(str(self.settings.task_contingency_default))
+                if team_members:
+                    mult = _task_contingency_multiplier(team_members[0].role, self.settings)
+                role_hours = total_hours * mult
                 if team_members:
                     m0 = team_members[0]
                     cost_rate = _resolve_cost_rate_per_day(m0, default_rates)
-                    hours_per_day = Decimal(m0.hours_per_day or 8)
+                    hours_per_day = Decimal(m0.hours_per_day or self.settings.default_hours_per_day)
                     util = m0.utilization_pct / Decimal(100)
                     if hours_per_day > 0 and util > 0:
                         cost_per_hour = cost_rate / (hours_per_day * util)
-                        total += total_hours * cost_per_hour
+                        total += role_hours * cost_per_hour
         return self._round(total)
 
     def cost_with_buffers(
@@ -225,15 +261,17 @@ class CalculationEngine:
     ) -> Decimal:
         """Sprint Capacity = Members × Working Days in Sprint × Hours × Utilization."""
         if not sprint_config:
-            working_days_per_month = 20
-            duration_weeks = 2
+            working_days_per_month = self.settings.default_working_days_per_month
+            duration_weeks = self.settings.default_sprint_duration_weeks
         else:
             working_days_per_month = sprint_config.working_days_per_month
             duration_weeks = sprint_config.duration_weeks
 
         days_in_sprint = Decimal(working_days_per_month * duration_weeks // 2)
         if days_in_sprint <= 0:
-            days_in_sprint = Decimal(10)
+            days_in_sprint = Decimal(
+                self.settings.default_working_days_per_month * self.settings.default_sprint_duration_weeks // 2
+            )
         total = Decimal(0)
         for m in team_members:
             capacity = (

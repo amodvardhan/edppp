@@ -21,7 +21,7 @@ router = APIRouter(prefix="/repository", tags=["repository"])
 
 async def _get_default_rates(db: AsyncSession) -> dict[str, tuple[Decimal, Decimal]]:
     result = await db.execute(select(RoleDefaultRate))
-    return {r.role: (r.cost_rate_per_day, r.billing_rate_per_day) for r in result.scalars().all()}
+    return {r.role.strip(): (r.cost_rate_per_day, r.billing_rate_per_day) for r in result.scalars().all()}
 
 
 @router.get("/projects")

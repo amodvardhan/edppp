@@ -21,14 +21,22 @@ import {
 } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
+import { CONFIG } from "../config";
 
 export interface SprintPlanningRow {
   id: string;
-  type: "sprint-week" | "phase";
+  type: "sprint-week" | "sprint" | "phase";
   sprintNum?: number;
   weekNum?: number;
   phase?: "pre_uat" | "uat" | "go_live";
   values: Record<string, number>;
+}
+
+/** Week range label for sprint N: W1-W2, W3-W4, etc. */
+function sprintWeekRange(sprintNum: number, sprintDurationWeeks: number): string {
+  const start = (sprintNum - 1) * sprintDurationWeeks + 1;
+  const end = sprintNum * sprintDurationWeeks;
+  return `W${start}-W${end}`;
 }
 
 const PHASE_LABELS: Record<string, string> = {
@@ -37,12 +45,89 @@ const PHASE_LABELS: Record<string, string> = {
   go_live: "Go Live",
 };
 
-const FALLBACK_ROLES = ["Technical Architect", "Project Manager", "QA"];
-
 function createEmptyValues(roles: string[]): Record<string, number> {
   const out: Record<string, number> = {};
   for (const r of roles) out[r] = 0;
   return out;
+}
+
+const PHASE_ORDER = ["pre_uat", "uat", "go_live"] as const;
+
+/** Ensures Pre UAT, UAT, Go Live rows are always at the end. Deduplicates phases. */
+export function ensurePhasesAtEnd(rows: SprintPlanningRow[]): SprintPlanningRow[] {
+  const sprintRows = rows.filter((r) => r.type === "sprint-week" || r.type === "sprint");
+  const phaseRows = rows.filter((r) => r.type === "phase");
+  const phaseByType = new Map<string, SprintPlanningRow>();
+  for (const r of phaseRows) {
+    const key = r.phase ?? "unknown";
+    if (!phaseByType.has(key)) phaseByType.set(key, r);
+  }
+  const sortedPhases = PHASE_ORDER
+    .filter((p) => phaseByType.has(p))
+    .map((p) => phaseByType.get(p)!);
+  return [...sprintRows, ...sortedPhases];
+}
+
+/** Merges old format (multiple rows per sprint) into new format (one row per sprint). Deduplicates phases. */
+export function migrateToSprintFormat(
+  rows: SprintPlanningRow[],
+  roles: string[],
+  roleCapacity?: Record<string, number>
+): SprintPlanningRow[] {
+  const sprintRows = rows.filter((r) => r.type === "sprint-week" || r.type === "sprint");
+  const phaseRows = rows.filter((r) => r.type === "phase");
+  const phaseByType = new Map<string, SprintPlanningRow>();
+  for (const r of phaseRows) {
+    const key = r.phase ?? "unknown";
+    if (!phaseByType.has(key)) phaseByType.set(key, r);
+  }
+  const dedupedPhases = PHASE_ORDER
+    .filter((p) => phaseByType.has(p))
+    .map((p) => {
+      const row = phaseByType.get(p)!;
+      const values: Record<string, number> = {};
+      for (const role of roles) {
+        values[role] = row.values[role] ?? 0;
+      }
+      const allZero = roles.every((role) => (values[role] ?? 0) === 0);
+      if (allZero && roleCapacity) {
+        for (const role of roles) {
+          values[role] = roleCapacity[role] ?? 0;
+        }
+      }
+      return { ...row, values };
+    });
+  const bySprint = new Map<number, SprintPlanningRow[]>();
+  for (const r of sprintRows) {
+    const n = r.sprintNum ?? 0;
+    if (n > 0) {
+      const arr = bySprint.get(n) ?? [];
+      arr.push(r);
+      bySprint.set(n, arr);
+    }
+  }
+  const merged: SprintPlanningRow[] = [];
+  for (const [sprintNum, weekRows] of [...bySprint.entries()].sort((a, b) => a[0] - b[0])) {
+    const first = weekRows[0];
+    const values: Record<string, number> = {};
+    for (const role of roles) {
+      values[role] = first.values[role] ?? 0;
+    }
+    const allZero = roles.every((role) => (values[role] ?? 0) === 0);
+    if (allZero && roleCapacity) {
+      for (const role of roles) {
+        values[role] = roleCapacity[role] ?? 0;
+      }
+    }
+    merged.push({
+      id: `s${sprintNum}`,
+      type: "sprint",
+      sprintNum,
+      weekNum: undefined,
+      values,
+    });
+  }
+  return [...merged, ...dedupedPhases];
 }
 
 function parseAllocation(v: string): number {
@@ -170,6 +255,8 @@ export interface SprintPlanningGridProps {
   roles: string[];
   sprintDurationWeeks?: number;
   isLocked?: boolean;
+  /** Role capacity for pre-filling new sprints (100%=1, 50%=0.5, etc.) */
+  roleCapacity?: Record<string, number>;
   onRowsChange: (rows: SprintPlanningRow[]) => void;
   onRolesChange?: (roles: string[]) => void;
 }
@@ -189,8 +276,9 @@ function computeColumnTotal(rows: SprintPlanningRow[], role: string): number {
 export default function SprintPlanningGrid({
   rows,
   roles,
-  sprintDurationWeeks = 2,
+  sprintDurationWeeks = CONFIG.defaultSprintDurationWeeks,
   isLocked = false,
+  roleCapacity = {},
   onRowsChange,
   onRolesChange,
 }: SprintPlanningGridProps) {
@@ -209,23 +297,23 @@ export default function SprintPlanningGrid({
 
   const addSprint = useCallback(() => {
     const maxSprint = rows.reduce((m, r) => {
-      if (r.type === "sprint-week" && r.sprintNum != null) {
+      if ((r.type === "sprint-week" || r.type === "sprint") && r.sprintNum != null) {
         return Math.max(m, r.sprintNum);
       }
       return m;
     }, 0);
     const newSprintNum = maxSprint + 1;
-    const empty = createEmptyValues(roles);
-    const newRows: SprintPlanningRow[] = [];
-    for (let w = 1; w <= sprintDurationWeeks; w++) {
-      newRows.push({
-        id: `s${newSprintNum}w${w}`,
-        type: "sprint-week",
-        sprintNum: newSprintNum,
-        weekNum: w,
-        values: { ...empty },
-      });
+    const values: Record<string, number> = {};
+    for (const role of roles) {
+      values[role] = roleCapacity[role] ?? 0;
     }
+    const newRows: SprintPlanningRow[] = [{
+      id: `s${newSprintNum}`,
+      type: "sprint",
+      sprintNum: newSprintNum,
+      weekNum: undefined,
+      values,
+    }];
     const phaseStart = rows.findIndex((r) => r.type === "phase");
     if (phaseStart >= 0) {
       const before = rows.slice(0, phaseStart);
@@ -234,11 +322,11 @@ export default function SprintPlanningGrid({
     } else {
       onRowsChange([...rows, ...newRows]);
     }
-  }, [rows, roles, sprintDurationWeeks, onRowsChange]);
+  }, [rows, roles, sprintDurationWeeks, roleCapacity, onRowsChange]);
 
   const removeLastSprint = useCallback(() => {
-    const sprintRows = rows.filter((r) => r.type === "sprint-week");
-    if (sprintRows.length < sprintDurationWeeks) return;
+    const sprintRows = rows.filter((r) => r.type === "sprint-week" || r.type === "sprint");
+    if (sprintRows.length < 1) return;
     const maxSprint = Math.max(
       ...sprintRows.map((r) => r.sprintNum ?? 0),
       0
@@ -248,7 +336,7 @@ export default function SprintPlanningGrid({
       .filter((r) => r.sprintNum === maxSprint)
       .map((r) => r.id);
     onRowsChange(rows.filter((r) => !toRemove.includes(r.id)));
-  }, [rows, sprintDurationWeeks, onRowsChange]);
+  }, [rows, onRowsChange]);
 
   const addRole = useCallback(() => {
     const name = prompt("Role name:");
@@ -300,7 +388,7 @@ export default function SprintPlanningGrid({
   const sprintWeeks = useMemo(() => {
     const bySprint = new Map<number, SprintPlanningRow[]>();
     for (const r of rows) {
-      if (r.type === "sprint-week" && r.sprintNum != null) {
+      if ((r.type === "sprint-week" || r.type === "sprint") && r.sprintNum != null) {
         const arr = bySprint.get(r.sprintNum) ?? [];
         arr.push(r);
         bySprint.set(r.sprintNum, arr);
@@ -321,7 +409,7 @@ export default function SprintPlanningGrid({
   }, [sprintWeeks]);
 
   const canRemoveSprint =
-    rows.filter((r) => r.type === "sprint-week").length > sprintDurationWeeks;
+    rows.filter((r) => r.type === "sprint-week" || r.type === "sprint").length > 1;
 
   return (
     <Box sx={{ width: "100%", minWidth: 0 }}>
@@ -449,14 +537,16 @@ export default function SprintPlanningGrid({
           <TableBody>
             {rows.map((r) => {
               const label =
-                r.type === "sprint-week"
-                  ? r.weekNum === 1
-                    ? `Sprint ${r.sprintNum}`
-                    : `Week ${r.weekNum}`
+                r.type === "sprint" || r.type === "sprint-week"
+                  ? r.type === "sprint"
+                    ? `Sprint ${r.sprintNum}   ${sprintWeekRange(r.sprintNum ?? 0, sprintDurationWeeks)}`
+                    : r.weekNum === 1
+                      ? `Sprint ${r.sprintNum}`
+                      : `Week ${r.weekNum}`
                   : r.phase
                     ? PHASE_LABELS[r.phase] ?? r.phase
                     : "";
-              const isSprintHeader = r.type === "sprint-week" && r.weekNum === 1;
+              const isSprintHeader = r.type === "sprint" || (r.type === "sprint-week" && r.weekNum === 1);
               return (
                 <TableRow key={r.id} hover>
                   <TableCell
@@ -571,31 +661,59 @@ export default function SprintPlanningGrid({
   );
 }
 
+/**
+ * Sprint planning flow:
+ * 1. Total effort (from features + contingency)
+ * 2. Sprint weeks (from project.sprint_duration_weeks, set at project creation)
+ * 3. Total sprints = ceil(total_effort / sprint_capacity) — from calculations API
+ * 4. Table generated with one row per sprint, cells pre-filled by role capacity
+ */
+
+/** Role capacity: 100% -> 1, 50% -> 0.5, 25% -> 0.25, 0% -> 0. Sum for multiple members with same role. */
+const PERCENT_TO_CAPACITY = 100;
+
+export function computeRoleCapacity(
+  team: { role: string; utilization_pct?: number }[]
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const m of team) {
+    const role = (m.role || "").trim();
+    if (!role) continue;
+    const cap = (m.utilization_pct ?? 0) / PERCENT_TO_CAPACITY;
+    out[role] = (out[role] ?? 0) + cap;
+  }
+  return out;
+}
+
 export function createInitialSprintPlanning(
-  teamRoles: string[],
-  sprintDurationWeeks: number = 2,
-  numSprints: number = 2
+  team: { role: string; utilization_pct?: number }[],
+  _sprintDurationWeeks: number,
+  numSprints: number,
+  defaultRoles: string[] = []
 ): { rows: SprintPlanningRow[]; roles: string[] } {
+  const teamRoles = team.map((m) => (m.role || "").trim()).filter(Boolean);
   const roles =
-    teamRoles.length > 0 ? [...teamRoles] : [...FALLBACK_ROLES];
-  const empty = createEmptyValues(roles);
+    teamRoles.length > 0 ? [...new Set(teamRoles)] : defaultRoles;
+  const roleCapacity = computeRoleCapacity(team);
+  const phaseValues: Record<string, number> = {};
+  for (const role of roles) {
+    phaseValues[role] = roleCapacity[role] ?? 0;
+  }
 
   const rows: SprintPlanningRow[] = [];
 
   for (let s = 1; s <= numSprints; s++) {
-    for (let w = 1; w <= sprintDurationWeeks; w++) {
-      const values: Record<string, number> = {};
-      for (const role of roles) {
-        values[role] = 0;
-      }
-      rows.push({
-        id: `s${s}w${w}`,
-        type: "sprint-week",
-        sprintNum: s,
-        weekNum: w,
-        values,
-      });
+    const values: Record<string, number> = {};
+    for (const role of roles) {
+      values[role] = roleCapacity[role] ?? 0;
     }
+    rows.push({
+      id: `s${s}`,
+      type: "sprint",
+      sprintNum: s,
+      weekNum: undefined,
+      values,
+    });
   }
 
   rows.push(
@@ -603,19 +721,19 @@ export function createInitialSprintPlanning(
       id: "pre_uat",
       type: "phase",
       phase: "pre_uat",
-      values: { ...empty },
+      values: { ...phaseValues },
     },
     {
       id: "uat",
       type: "phase",
       phase: "uat",
-      values: { ...empty },
+      values: { ...phaseValues },
     },
     {
       id: "go_live",
       type: "phase",
       phase: "go_live",
-      values: { ...empty },
+      values: { ...phaseValues },
     }
   );
 

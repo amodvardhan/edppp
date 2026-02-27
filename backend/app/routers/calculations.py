@@ -28,7 +28,7 @@ router = APIRouter(prefix="/projects", tags=["calculations"])
 
 async def _get_default_rates(db: AsyncSession) -> dict[str, tuple[Decimal, Decimal]]:
     result = await db.execute(select(RoleDefaultRate))
-    return {r.role: (r.cost_rate_per_day, r.billing_rate_per_day) for r in result.scalars().all()}
+    return {r.role.strip(): (r.cost_rate_per_day, r.billing_rate_per_day) for r in result.scalars().all()}
 
 
 async def _load_version_data(db: AsyncSession, project_id: int):
@@ -157,9 +157,22 @@ async def get_sprint_allocation(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(get_current_user)],
 ):
+    """
+    Sprint planning steps:
+    1. Total effort = features (with task contingency) × version contingency
+    2. Sprint weeks = from project creation (sprint_duration_weeks)
+    3. Total sprints = ceil(total_effort / sprint_capacity)
+    4. Frontend generates the table with sprints_required rows
+    """
     version, _ = await _load_version_data(db, project_id)
     engine = CalculationEngine()
-    total_effort = engine.total_effort_hours(list(version.features))
+    effort_allocations = {f.id: list(f.effort_allocations or []) for f in version.features}
+    effort_with_task_contingency = engine.total_effort_hours_with_task_contingency(
+        list(version.features),
+        effort_allocations,
+    )
+    contingency_factor = Decimal(1) + (version.contingency_pct or 0) / Decimal(100)
+    total_effort = engine._round(effort_with_task_contingency * contingency_factor)
     capacity = engine.sprint_capacity(
         list(version.team_members),
         version.sprint_config,
@@ -198,7 +211,13 @@ async def reverse_margin(
         version.contingency_pct,
         version.management_reserve_pct,
     )
-    total_effort = engine.total_effort_hours(list(version.features))
+    effort_allocations = {f.id: list(f.effort_allocations or []) for f in version.features}
+    effort_with_task = engine.total_effort_hours_with_task_contingency(
+        list(version.features),
+        effort_allocations,
+    )
+    contingency_factor = Decimal(1) + (version.contingency_pct or 0) / Decimal(100)
+    total_effort = engine._round(effort_with_task * contingency_factor)
     required_revenue = engine.reverse_margin_revenue(total_cost, target_margin_pct)
     required_billing = engine.reverse_margin_billing_rate(
         total_cost,

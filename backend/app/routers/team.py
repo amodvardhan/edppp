@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import get_current_user, get_user_roles
+from app.config import get_settings
 from app.auth.rbac import can_edit_team
 from app.database import get_db
 from app.models.audit import AuditLog
@@ -68,7 +69,7 @@ async def ai_suggest_team(
     ]
     total_effort = sum(float(f.effort_hours) for f in features)
     members, raw = await suggest_team_allocation(
-        features, total_effort, project.sprint_duration_weeks or 2
+        features, total_effort, project.sprint_duration_weeks or get_settings().default_sprint_duration_weeks
     )
     return AITeamSuggestionResponse(members=members, raw_suggestion=raw)
 
@@ -148,8 +149,10 @@ async def update_team_member(
     member = await db.get(TeamMember, member_id)
     if not member or member.version_id != version.id:
         raise HTTPException(status_code=404, detail="Member not found")
-    for k, v in data.model_dump(exclude_unset=True).items():
+    updates = data.model_dump(exclude_unset=True)
+    for k, v in updates.items():
         setattr(member, k, v)
+    await db.flush()
     db.add(AuditLog(
         project_id=project_id,
         version_id=version.id,

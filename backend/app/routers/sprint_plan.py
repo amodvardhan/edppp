@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.deps import get_current_user, get_user_roles
 from app.auth.rbac import can_edit_team, can_edit_features
 from app.database import get_db
+from app.models.bu_rate import RoleDefaultRate
 from app.models.project import ProjectVersion
 from app.models.sprint_plan import SprintPlanRow
 from app.models.team import TeamMember
@@ -32,7 +33,9 @@ async def _get_version(db: AsyncSession, project_id: int, require_unlocked: bool
 
 
 def _row_to_schema(r: SprintPlanRow) -> SprintPlanRowSchema:
-    if r.row_type == "sprint-week" and r.sprint_num is not None and r.week_num is not None:
+    if r.row_type == "sprint" and r.sprint_num is not None:
+        row_id = f"s{r.sprint_num}"
+    elif r.row_type == "sprint-week" and r.sprint_num is not None and r.week_num is not None:
         row_id = f"s{r.sprint_num}w{r.week_num}"
     else:
         row_id = r.phase or f"row_{r.id}"
@@ -63,7 +66,8 @@ async def get_sprint_plan(
     team = team_result.scalars().all()
     roles = list(dict.fromkeys(m.role for m in team))
     if not roles:
-        roles = ["Technical Architect", "Project Manager", "QA"]
+        bu_result = await db.execute(select(RoleDefaultRate.role).order_by(RoleDefaultRate.role))
+        roles = list(bu_result.scalars().all())
     if rows:
         schema_rows = [_row_to_schema(r) for r in rows]
         all_roles = set(roles)

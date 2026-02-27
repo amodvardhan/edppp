@@ -5,6 +5,7 @@ import "react-data-grid/lib/styles.css";
 import { Box, Button, IconButton, TextField, Typography, useTheme } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
+import { CONFIG } from "../config";
 import { buRatesApi, type FeatureCreate, type FeatureTask, type Project, type ProjectVersion, type TeamMember } from "../lib/api";
 
 export interface GridRow {
@@ -17,20 +18,34 @@ export interface GridRow {
   /** BU role user selected (for billing rate & cost calculation) */
   role: string;
   priority: number;
+  /** Feature ID when editing existing features (for persist) */
+  featureId?: number;
 }
 
-function featuresToRows(features: FeatureCreate[], buRoleNames: string[]): GridRow[] {
+export type FeatureCreateWithId = FeatureCreate & { id?: number };
+
+/** Match AI role to BU role: exact match, or BU role contains AI role (e.g. "Developer" -> "Senior Developer"). */
+function matchRoleToBu(aiRole: string, buRoleNames: string[]): string {
+  const r = (aiRole || "").trim();
+  if (!r) return "";
+  const lower = r.toLowerCase();
+  const exact = buRoleNames.find((bu) => bu.toLowerCase() === lower);
+  if (exact) return exact;
+  const contains = buRoleNames.find((bu) => bu.toLowerCase().includes(lower) || lower.includes(bu.toLowerCase()));
+  return contains ?? "";
+}
+
+function featuresToRows(features: FeatureCreateWithId[], roleOptions: string[]): GridRow[] {
   let id = 0;
   const rows: GridRow[] = [];
-  const roleMatchesBu = (r: string) =>
-    r?.trim() && buRoleNames.some((bu) => bu.toLowerCase() === r.trim().toLowerCase());
   for (const f of features) {
+    const featureId = "id" in f && typeof f.id === "number" ? f.id : undefined;
     const priority = f.priority ?? 1;
     const tasks = f.tasks && f.tasks.length > 0 ? f.tasks : [{ name: f.name, effort_hours: f.effort_hours, role: "" }];
     for (const t of tasks) {
       const taskRole = String(t.role ?? "").trim();
       const aiSuggested = taskRole || "";
-      const selectedBuRole = buRoleNames.length > 0 && roleMatchesBu(taskRole) ? taskRole : "";
+      const selectedBuRole = roleOptions.length > 0 ? matchRoleToBu(taskRole, roleOptions) : "";
       rows.push({
         id: ++id,
         feature: f.name,
@@ -39,31 +54,51 @@ function featuresToRows(features: FeatureCreate[], buRoleNames: string[]): GridR
         aiSuggestedRole: aiSuggested,
         role: selectedBuRole,
         priority,
+        featureId,
       });
     }
   }
   return rows;
 }
 
-function rowsToFeatures(rows: GridRow[]): FeatureCreate[] {
+function rowsToFeatures(rows: GridRow[]): FeatureCreateWithId[] {
   const byFeature = new Map<string, GridRow[]>();
   for (const r of rows) {
     const key = r.feature.trim() || "(Unnamed)";
     if (!byFeature.has(key)) byFeature.set(key, []);
     byFeature.get(key)!.push(r);
   }
-  const features: FeatureCreate[] = [];
+  const features: FeatureCreateWithId[] = [];
   for (const [name, taskRows] of byFeature) {
     const tasks: FeatureTask[] = taskRows
       .filter((r: GridRow) => String(r.task || "").trim())
       .map((r: GridRow) => ({
         name: r.task,
         effort_hours: Number(r.hours) || 0,
-        role: String(r.role || r.aiSuggestedRole || "").trim(),
+        role: String(r.role || r.aiSuggestedRole || "").trim() || "Unassigned",
       }));
     const effort_hours = taskRows.reduce((s: number, r: GridRow) => s + (Number(r.hours) || 0), 0);
     const priority = Number(taskRows[0]?.priority) || 1;
-    features.push({ name, effort_hours, priority, tasks: tasks.length > 0 ? tasks : undefined });
+    const featureId = taskRows[0]?.featureId;
+    const roleHours: Record<string, number> = {};
+    for (const t of tasks) {
+      const role = t.role || "Unassigned";
+      roleHours[role] = (roleHours[role] || 0) + t.effort_hours;
+    }
+    const totalHrs = Object.values(roleHours).reduce((a, b) => a + b, 0) || 1;
+    const effort_allocations = Object.entries(roleHours).map(([role, hrs]) => ({
+      role,
+      allocation_pct: Math.round((hrs / totalHrs) * 10000) / 100,
+      effort_hours: hrs,
+    }));
+    features.push({
+      ...(featureId != null && { id: featureId }),
+      name,
+      effort_hours,
+      priority,
+      tasks: tasks.length > 0 ? tasks : undefined,
+      effort_allocations,
+    });
   }
   return features;
 }
@@ -73,9 +108,17 @@ function rowGrouper(rows: readonly GridRow[], columnKey: string): Record<string,
   for (const r of rows) {
     const key = String(r[columnKey as keyof GridRow] ?? "").trim() || "(Unnamed)";
     if (!map[key]) map[key] = [];
-    map[key].push({ ...r });
+    map[key].push(r);
   }
   return map;
+}
+
+/** Task-level contingency multiplier by role seniority - from config. */
+function getTaskContingencyMultiplier(role: string): number {
+  const r = (role || "").toLowerCase();
+  if (r.includes("junior") || r.includes("jr ")) return CONFIG.taskContingencyJunior;
+  if (r.includes("senior") || r.includes("sr ") || r.includes("lead")) return CONFIG.taskContingencySenior;
+  return CONFIG.taskContingencyDefault;
 }
 
 /** Case-insensitive lookup: "Developer" matches "developer", "QA Engineer" matches "qa engineer". */
@@ -90,16 +133,21 @@ function getRateForRole(role: string, rates: Record<string, number>): number {
 
 /** Base rate per day: ONLY BU billing rates (Billing/Day). Grid must not use team/AI suggestions. */
 function getBuRatesForGrid(buRates: { role: string; billing_rate_per_day: number }[]): Record<string, number> {
-  return Object.fromEntries(buRates.map((r) => [r.role, r.billing_rate_per_day]));
+  return Object.fromEntries(
+    buRates
+      .map((r) => [(r.role || "").trim(), r.billing_rate_per_day] as [string, number])
+      .filter(([role]) => role.length > 0)
+  );
 }
 
 function computeSprintCapacity(team: TeamMember[], sprintWeeks: number): number {
-  const workingDaysPerMonth = 20;
-  const daysInSprint = (workingDaysPerMonth * sprintWeeks) / 2;
   let total = 0;
   for (const m of team) {
-    const hours = (m.hours_per_day ?? 8) * daysInSprint * ((m.utilization_pct ?? 80) / 100);
-    total += hours;
+    const workingDays = m.working_days_per_month ?? CONFIG.defaultWorkingDaysPerMonth;
+    const daysInSprint = (workingDays * sprintWeeks) / 2;
+    const hoursPerDay = m.hours_per_day ?? CONFIG.defaultHoursPerDay;
+    const utilization = (m.utilization_pct ?? CONFIG.defaultUtilizationPct) / 100;
+    total += hoursPerDay * daysInSprint * utilization;
   }
   return total;
 }
@@ -114,14 +162,16 @@ function formatCurrency(value: number, currency: string) {
 }
 
 interface FeaturesTasksGridProps {
-  features: FeatureCreate[];
-  onChange: (features: FeatureCreate[]) => void;
+  features: FeatureCreateWithId[];
+  onChange: (features: FeatureCreateWithId[]) => void;
   project?: Project;
   version?: ProjectVersion;
   team?: TeamMember[];
   onContingencyChange?: (pct: number) => void;
   minHeight?: number;
   autoHeight?: boolean;
+  /** When true, disables all editing (e.g. when project is Won/locked) */
+  readOnly?: boolean;
 }
 
 export default function FeaturesTasksGrid({
@@ -133,6 +183,7 @@ export default function FeaturesTasksGrid({
   onContingencyChange,
   minHeight = 280,
   autoHeight = true,
+  readOnly = false,
 }: FeaturesTasksGridProps) {
   const theme = useTheme();
   const [rows, setRows] = useState<GridRow[]>(() => featuresToRows(features, []));
@@ -145,9 +196,11 @@ export default function FeaturesTasksGrid({
     }
     return ids;
   });
-  const [contingencyPct, setContingencyPct] = useState(() => (version != null ? Number(version.contingency_pct) || 15 : 15));
+  const [contingencyPct, setContingencyPct] = useState(
+    () => (version != null ? Number(version.contingency_pct) : CONFIG.defaultContingencyPct)
+  );
   useEffect(() => {
-    if (version != null) setContingencyPct(Number(version.contingency_pct) || 15);
+    if (version != null) setContingencyPct(Number(version.contingency_pct));
   }, [version?.contingency_pct]);
 
   const currency = project?.currency ?? "USD";
@@ -155,10 +208,15 @@ export default function FeaturesTasksGrid({
     queryKey: ["buRates"],
     queryFn: () => buRatesApi.list(),
   });
-  const buRoleNames = useMemo(() => buRates.map((r) => r.role), [buRates]);
+  const buRoleNames = useMemo(() => buRates.map((r) => (r.role || "").trim()).filter(Boolean), [buRates]);
+  const teamRoleNames = useMemo(() => [...new Set(team.map((m) => (m.role || "").trim()).filter(Boolean))], [team]);
+  const roleOptionsForDropdown = useMemo(
+    () => [...new Set([...teamRoleNames, ...buRoleNames])].filter(Boolean).sort(),
+    [teamRoleNames, buRoleNames]
+  );
 
   useEffect(() => {
-    const newRows = featuresToRows(features, buRoleNames);
+    const newRows = featuresToRows(features, roleOptionsForDropdown);
     setRows((prev) => {
       if (prev.length !== newRows.length) return newRows;
       const same = prev.every(
@@ -174,9 +232,9 @@ export default function FeaturesTasksGrid({
       );
       return same ? prev : newRows;
     });
-  }, [features, buRoleNames]);
+  }, [features, roleOptionsForDropdown]);
   const baseRatePerDay = useMemo(() => getBuRatesForGrid(buRates), [buRates]);
-  const sprintWeeks = project?.sprint_duration_weeks ?? 2;
+  const sprintWeeks = project?.sprint_duration_weeks ?? CONFIG.defaultSprintDurationWeeks;
 
   const syncToFeatures = useCallback(
     (newRows: GridRow[]) => {
@@ -208,15 +266,16 @@ export default function FeaturesTasksGrid({
   const nextId = useMemo(() => Math.max(0, ...rows.map((r) => r.id)) + 1, [rows]);
 
   const addTask = useCallback(() => {
-    const lastFeature = rows.length > 0 ? rows[rows.length - 1].feature : "";
+    const lastRow = rows.length > 0 ? rows[rows.length - 1] : null;
     const newRow: GridRow = {
       id: nextId,
-      feature: lastFeature,
+      feature: lastRow?.feature ?? "",
       task: "",
       hours: 0,
       aiSuggestedRole: "",
       role: "",
-      priority: 1,
+      priority: lastRow?.priority ?? 1,
+      featureId: lastRow?.featureId,
     };
     const newRows = [...rows, newRow];
     syncToFeatures(newRows);
@@ -232,6 +291,7 @@ export default function FeaturesTasksGrid({
       aiSuggestedRole: "",
       role: "",
       priority: 1,
+      featureId: undefined,
     };
     const newRows = [...rows, newRow];
     syncToFeatures(newRows);
@@ -252,8 +312,8 @@ export default function FeaturesTasksGrid({
         value={row.role || ""}
         onChange={(e) => {
           const selectedBuRole = e.target.value;
-          onRowChange({ ...row, role: selectedBuRole });
-          onClose(true);
+          const updatedRow = { ...row, role: selectedBuRole };
+          onRowChange(updatedRow, true);
         }}
         onBlur={() => onClose(true)}
         autoFocus
@@ -267,15 +327,15 @@ export default function FeaturesTasksGrid({
           background: theme.palette.background.paper,
         }}
       >
-        <option value="">Select BU role</option>
-        {buRoleNames.map((r) => (
+        <option value="">Select role</option>
+        {roleOptionsForDropdown.map((r) => (
           <option key={r} value={r}>
             {r}
           </option>
         ))}
       </select>
     ),
-    [theme, buRoleNames]
+    [theme, roleOptionsForDropdown]
   );
 
   const NumberEditor = useCallback(({ column, row, onRowChange, onClose }: RenderEditCellProps<GridRow>) => {
@@ -302,7 +362,7 @@ export default function FeaturesTasksGrid({
   const FeatureGroupCell = useCallback(
     ({ groupKey, isExpanded, toggleGroup, tabIndex }: RenderGroupCellProps<GridRow>) => {
       const displayKey = String(groupKey);
-      const isEditing = editingGroupKey === displayKey;
+      const isEditing = !readOnly && editingGroupKey === displayKey;
       return (
         <span className="rdg-group-cell-content" style={{ display: "flex", alignItems: "center", gap: 8, width: "100%" }}>
           <span
@@ -338,11 +398,19 @@ export default function FeaturesTasksGrid({
           ) : (
             <span
               onClick={(e) => {
-                e.stopPropagation();
-                setEditingGroupKey(displayKey);
-                setEditingValue(displayKey);
+                if (!readOnly) {
+                  e.stopPropagation();
+                  setEditingGroupKey(displayKey);
+                  setEditingValue(displayKey);
+                }
               }}
-              style={{ flex: 1, cursor: "text", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}
+              style={{
+                flex: 1,
+                cursor: readOnly ? "default" : "text",
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              }}
             >
               {displayKey}
             </span>
@@ -350,7 +418,7 @@ export default function FeaturesTasksGrid({
         </span>
       );
     },
-    [handleFeatureRename, theme, editingGroupKey, editingValue]
+    [handleFeatureRename, theme, editingGroupKey, editingValue, readOnly]
   );
 
   const primaryMain = theme.palette.primary.main;
@@ -374,7 +442,7 @@ export default function FeaturesTasksGrid({
   const HOURS_PER_DAY = 8;
 
   const colWidths = useMemo(() => {
-    const w = containerWidth - 44;
+    const w = containerWidth - (readOnly ? 0 : 44);
     return {
       feature: Math.max(180, Math.floor(w * 0.24)),
       task: Math.max(180, Math.floor(w * 0.24)),
@@ -384,40 +452,55 @@ export default function FeaturesTasksGrid({
       cost: 95,
       priority: 80,
     };
-  }, [containerWidth]);
+  }, [containerWidth, readOnly]);
 
   const roleSummary = useMemo(() => {
     const byRole: Record<string, { hours: number; cost: number }> = {};
     for (const r of rows) {
       const role = r.role.trim() || "(Unassigned)";
-      const hrs = Number(r.hours) || 0;
+      const baseHrs = Number(r.hours) || 0;
+      const mult = getTaskContingencyMultiplier(r.role || r.aiSuggestedRole);
+      const effectiveHrs = baseHrs * mult;
       const ratePerDay = getRateForRole(r.role, baseRatePerDay);
-      const cost = ratePerDay > 0 ? hrs * (ratePerDay / HOURS_PER_DAY) : 0;
+      const cost = ratePerDay > 0 ? effectiveHrs * (ratePerDay / HOURS_PER_DAY) : 0;
       if (!byRole[role]) byRole[role] = { hours: 0, cost: 0 };
-      byRole[role].hours += hrs;
+      byRole[role].hours += effectiveHrs;
       byRole[role].cost += cost;
     }
     return Object.entries(byRole).sort((a, b) => b[1].hours - a[1].hours);
   }, [rows, baseRatePerDay]);
 
-  const totalEffort = useMemo(() => rows.reduce((s, r) => s + (Number(r.hours) || 0), 0), [rows]);
+  const baseEffort = useMemo(() => rows.reduce((s, r) => s + (Number(r.hours) || 0), 0), [rows]);
+  const totalEffortWithTaskContingency = useMemo(
+    () =>
+      rows.reduce((s, r) => {
+        const baseHrs = Number(r.hours) || 0;
+        const mult = getTaskContingencyMultiplier(r.role || r.aiSuggestedRole);
+        return s + baseHrs * mult;
+      }, 0),
+    [rows]
+  );
+  const totalEffortWithSummaryContingency = totalEffortWithTaskContingency * (1 + contingencyPct / 100);
   const baseCost = useMemo(
     () =>
       rows.reduce((s, r) => {
-        const hrs = Number(r.hours) || 0;
+        const baseHrs = Number(r.hours) || 0;
+        const mult = getTaskContingencyMultiplier(r.role || r.aiSuggestedRole);
+        const effectiveHrs = baseHrs * mult;
         const ratePerDay = getRateForRole(r.role, baseRatePerDay);
-        return s + (ratePerDay > 0 ? hrs * (ratePerDay / HOURS_PER_DAY) : 0);
+        return s + (ratePerDay > 0 ? effectiveHrs * (ratePerDay / HOURS_PER_DAY) : 0);
       }, 0),
     [rows, baseRatePerDay]
   );
   const sprintCapacity = useMemo(() => computeSprintCapacity(team, sprintWeeks), [team, sprintWeeks]);
-  const sprintsRequired = sprintCapacity > 0 ? Math.ceil(totalEffort / sprintCapacity) : 0;
+  const sprintsRequired =
+    sprintCapacity > 0 ? Math.ceil(totalEffortWithSummaryContingency / sprintCapacity) : 0;
   const reservePct = version?.management_reserve_pct ? Number(version.management_reserve_pct) : 0;
   const totalWithBuffers = baseCost * (1 + contingencyPct / 100 + reservePct / 100);
 
   const columns: Column<GridRow>[] = useMemo(
     () => [
-      { ...SelectColumn, width: 44, minWidth: 44 },
+      ...(readOnly ? [] : [{ ...SelectColumn, width: 44, minWidth: 44 }]),
       {
         key: "feature",
         name: "Feature",
@@ -431,7 +514,7 @@ export default function FeaturesTasksGrid({
         name: "Task",
         minWidth: 180,
         width: colWidths.task,
-        editable: true,
+        editable: !readOnly,
         resizable: true,
       },
       {
@@ -439,7 +522,7 @@ export default function FeaturesTasksGrid({
         name: "Hours",
         minWidth: 70,
         width: colWidths.hours,
-        editable: true,
+        editable: !readOnly,
         resizable: true,
         renderEditCell: NumberEditor,
       },
@@ -448,13 +531,13 @@ export default function FeaturesTasksGrid({
         name: "Role",
         minWidth: 120,
         width: colWidths.role,
-        editable: true,
+        editable: !readOnly,
         resizable: true,
         renderEditCell: RoleEditor,
         renderCell: ({ row }) => {
           const ai = row.aiSuggestedRole?.trim();
           const selected = row.role?.trim();
-          if (ai && selected && ai !== selected) return `${ai} → ${selected}`;
+          if (selected) return ai && ai !== selected ? `${ai} → ${selected}` : selected;
           if (ai) return ai;
           return "—";
         },
@@ -477,9 +560,11 @@ export default function FeaturesTasksGrid({
         width: colWidths.cost,
         resizable: true,
         renderCell: ({ row }) => {
-          const hrs = Number(row.hours) || 0;
+          const baseHrs = Number(row.hours) || 0;
+          const mult = getTaskContingencyMultiplier(row.role || row.aiSuggestedRole);
+          const effectiveHrs = baseHrs * mult;
           const ratePerDay = getRateForRole(row.role, baseRatePerDay);
-          const cost = ratePerDay > 0 ? hrs * (ratePerDay / HOURS_PER_DAY) : 0;
+          const cost = ratePerDay > 0 ? effectiveHrs * (ratePerDay / HOURS_PER_DAY) : 0;
           return cost > 0 ? formatCurrency(cost, currency) : "—";
         },
       },
@@ -488,12 +573,12 @@ export default function FeaturesTasksGrid({
         name: "Priority",
         minWidth: 70,
         width: colWidths.priority,
-        editable: true,
+        editable: !readOnly,
         resizable: true,
         renderEditCell: NumberEditor,
       },
     ],
-    [NumberEditor, RoleEditor, FeatureGroupCell, baseRatePerDay, buRoleNames, currency, colWidths]
+    [NumberEditor, RoleEditor, FeatureGroupCell, baseRatePerDay, roleOptionsForDropdown, currency, colWidths, readOnly]
   );
 
   const gridHeight = useMemo(() => {
@@ -563,41 +648,43 @@ export default function FeaturesTasksGrid({
         />
       </Box>
 
-      <Box
-        sx={{
-          display: "flex",
-          alignItems: "center",
-          gap: 1,
-          py: 1.5,
-          px: 1,
-          border: "1px solid",
-          borderColor: "divider",
-          borderTop: "none",
-          bgcolor: "action.hover",
-          borderRadius: "0 0 8px 8px",
-        }}
-      >
-        <Button size="small" startIcon={<AddIcon />} onClick={addTask} variant="outlined">
-          Add task
-        </Button>
-        <Button size="small" startIcon={<AddIcon />} onClick={addFeature} variant="outlined">
-          Add feature
-        </Button>
-        <IconButton
-          size="small"
-          onClick={deleteSelected}
-          disabled={selectedRows.size === 0}
-          title="Delete selected rows"
-          color="error"
+      {!readOnly && (
+        <Box
+          sx={{
+            display: "flex",
+            alignItems: "center",
+            gap: 1,
+            py: 1.5,
+            px: 1,
+            border: "1px solid",
+            borderColor: "divider",
+            borderTop: "none",
+            bgcolor: "action.hover",
+            borderRadius: "0 0 8px 8px",
+          }}
         >
-          <DeleteOutlineIcon fontSize="small" />
-        </IconButton>
-        {selectedRows.size > 0 && (
-          <Box component="span" sx={{ fontSize: "0.8125rem", color: "text.secondary", ml: 1 }}>
-            {selectedRows.size} selected
-          </Box>
-        )}
-      </Box>
+          <Button size="small" startIcon={<AddIcon />} onClick={addTask} variant="outlined">
+            Add task
+          </Button>
+          <Button size="small" startIcon={<AddIcon />} onClick={addFeature} variant="outlined">
+            Add feature
+          </Button>
+          <IconButton
+            size="small"
+            onClick={deleteSelected}
+            disabled={selectedRows.size === 0}
+            title="Delete selected rows"
+            color="error"
+          >
+            <DeleteOutlineIcon fontSize="small" />
+          </IconButton>
+          {selectedRows.size > 0 && (
+            <Box component="span" sx={{ fontSize: "0.8125rem", color: "text.secondary", ml: 1 }}>
+              {selectedRows.size} selected
+            </Box>
+          )}
+        </Box>
+      )}
 
       <Box
         sx={{
@@ -656,7 +743,8 @@ export default function FeaturesTasksGrid({
               Sprint plan
             </Typography>
             <Typography variant="body2" sx={{ mt: 0.5 }}>
-              <strong>{totalEffort.toFixed(0)}h</strong> effort · <strong>{sprintCapacity.toFixed(0)}h</strong> capacity/sprint
+              <strong>{baseEffort.toFixed(0)}h</strong> base · <strong>{totalEffortWithSummaryContingency.toFixed(0)}h</strong> effort (+{contingencyPct}%)
+              · <strong>{sprintCapacity.toFixed(0)}h</strong> capacity/sprint
             </Typography>
             <Typography variant="body2">
               <strong>{sprintsRequired}</strong> sprints required

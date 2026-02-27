@@ -18,6 +18,7 @@ import {
 } from "@mui/material";
 import ArrowForwardIcon from "@mui/icons-material/ArrowForward";
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
+import { CONFIG } from "../config";
 import { projectsApi } from "../lib/api";
 
 const steps = ["Basic info", "Revenue & timeline", "Review"];
@@ -30,7 +31,7 @@ export default function CreateProject() {
     client_name: "",
     revenue_model: "fixed" as "fixed" | "t_m" | "milestone",
     currency: "USD",
-    sprint_duration_weeks: 2,
+    sprint_duration_weeks: CONFIG.defaultSprintDurationWeeks,
     fixed_revenue: undefined as number | undefined,
   });
 

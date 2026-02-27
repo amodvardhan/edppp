@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -19,6 +19,7 @@ import {
   TextField,
   Chip,
   Alert,
+  IconButton,
   Dialog,
   DialogTitle,
   DialogContent,
@@ -28,6 +29,7 @@ import {
 } from "@mui/material";
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
+import EditIcon from "@mui/icons-material/Edit";
 import LockIcon from "@mui/icons-material/Lock";
 import LockOpenIcon from "@mui/icons-material/LockOpen";
 import PersonAddIcon from "@mui/icons-material/PersonAdd";
@@ -38,6 +40,7 @@ import {
   projectsApi,
   sprintPlanApi,
   teamApi,
+  buRatesApi,
   featuresApi,
   calculationsApi,
   versionsApi,
@@ -45,14 +48,20 @@ import {
   fromApiRow,
   type TeamMemberCreate,
   type FeatureCreate,
+  type Feature,
   type Project,
   type ProjectVersion,
   type TeamMember,
 } from "../lib/api";
+import type { FeatureCreateWithId } from "../components/FeaturesTasksGrid";
 import { useAuth } from "../contexts/AuthContext";
 import FeaturesTasksGrid from "../components/FeaturesTasksGrid";
+import { CONFIG } from "../config";
 import SprintPlanningGrid, {
+  computeRoleCapacity,
   createInitialSprintPlanning,
+  ensurePhasesAtEnd,
+  migrateToSprintFormat,
   type SprintPlanningRow,
 } from "../components/SprintPlanningGrid";
 
@@ -65,6 +74,23 @@ function formatCurrency(value: number, currency: string) {
   }).format(value);
 }
 
+function featureToCreateWithId(f: Feature): FeatureCreateWithId {
+  return {
+    id: f.id,
+    name: f.name,
+    description: f.description,
+    priority: f.priority,
+    effort_hours: f.effort_hours,
+    effort_story_points: f.effort_story_points,
+    effort_allocations: f.effort_allocations?.map((a) => ({
+      role: a.role,
+      allocation_pct: a.allocation_pct,
+      effort_hours: a.effort_hours,
+    })),
+    tasks: f.tasks?.map((t) => ({ name: t.name, effort_hours: t.effort_hours, role: t.role })),
+  };
+}
+
 export default function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
   const projectId = parseInt(id || "0", 10);
@@ -73,6 +99,7 @@ export default function ProjectDetail() {
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<"team" | "features" | "calculations" | "sprint">("features");
   const [showAddMember, setShowAddMember] = useState(false);
+  const [editingMember, setEditingMember] = useState<TeamMember | null>(null);
   const [showAddFeature, setShowAddFeature] = useState(false);
   const [showAiUpload, setShowAiUpload] = useState(false);
   const [showAiTeamSuggest, setShowAiTeamSuggest] = useState(false);
@@ -82,6 +109,7 @@ export default function ProjectDetail() {
     roles: string[];
   } | null>(null);
   const saveSprintPlanTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveFeaturesTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const canEditTeam = hasRole("admin") || hasRole("delivery_manager");
   const canEditFeatures = hasRole("admin") || hasRole("delivery_manager") || hasRole("business_analyst");
@@ -140,7 +168,7 @@ export default function ProjectDetail() {
   } = useQuery({
     queryKey: ["sprint", projectId],
     queryFn: () => calculationsApi.sprint(projectId),
-    enabled: projectId > 0 && activeTab === "calculations",
+    enabled: projectId > 0,
   });
 
   const {
@@ -157,6 +185,11 @@ export default function ProjectDetail() {
     queryKey: ["sprintPlan", projectId],
     queryFn: () => sprintPlanApi.get(projectId),
     enabled: projectId > 0,
+  });
+
+  const { data: buRates = [] } = useQuery({
+    queryKey: ["buRates"],
+    queryFn: () => buRatesApi.list(),
   });
 
   const saveSprintPlanMutation = useMutation({
@@ -197,6 +230,24 @@ export default function ProjectDetail() {
     },
   });
 
+  const updateMemberMutation = useMutation({
+    mutationFn: ({ id, data }: { id: number; data: Partial<TeamMemberCreate> }) =>
+      teamApi.update(projectId, id, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["team", projectId] });
+      queryClient.invalidateQueries({ queryKey: ["sprintPlan", projectId] });
+      setEditingMember(null);
+    },
+  });
+
+  const deleteMemberMutation = useMutation({
+    mutationFn: (memberId: number) => teamApi.delete(projectId, memberId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["team", projectId] });
+      queryClient.invalidateQueries({ queryKey: ["sprintPlan", projectId] });
+    },
+  });
+
   const addFeatureMutation = useMutation({
     mutationFn: (data: FeatureCreate) => featuresApi.add(projectId, data),
     onSuccess: () => {
@@ -224,25 +275,62 @@ export default function ProjectDetail() {
   useEffect(() => {
     if (!project || !sprintPlanApiData) return;
     if (sprintPlanApiData.rows.length > 0) {
+      const apiRows = sprintPlanApiData.rows.map(fromApiRow);
+      const roleCapacity = computeRoleCapacity(team ?? []);
+      const migrated = migrateToSprintFormat(
+        apiRows,
+        sprintPlanApiData.roles,
+        roleCapacity
+      );
+      const hasSprintRows = migrated.some((r) => r.type === "sprint" || r.type === "sprint-week");
+      if (!hasSprintRows) {
+        const teamRoles = team?.map((m) => m.role) ?? [];
+        if (teamRoles.length > 0 && !sprintLoading) {
+          const numSprints = Math.max(CONFIG.minSprints, sprint?.sprints_required ?? CONFIG.minSprints);
+          const defaultRoles = buRates.map((r) => (r.role || "").trim()).filter(Boolean);
+          const { rows, roles } = createInitialSprintPlanning(
+            team ?? [],
+            project.sprint_duration_weeks ?? CONFIG.defaultSprintDurationWeeks,
+            numSprints,
+            defaultRoles
+          );
+          setSprintPlan({ rows, roles });
+          if (!(version?.is_locked ?? false)) {
+            saveSprintPlanMutation.mutate({ rows, roles });
+          }
+        } else {
+          setSprintPlan(null);
+        }
+        return;
+      }
+      const sorted = ensurePhasesAtEnd(migrated);
+      const needsMigration = apiRows.some((r) => r.type === "sprint-week" && r.weekNum != null);
       setSprintPlan({
-        rows: sprintPlanApiData.rows.map(fromApiRow),
+        rows: sorted,
         roles: sprintPlanApiData.roles,
       });
+      if (needsMigration && !(version?.is_locked ?? false)) {
+        saveSprintPlanMutation.mutate({ rows: sorted, roles: sprintPlanApiData.roles });
+      }
     } else {
       const teamRoles = team?.map((m) => m.role) ?? [];
       if (teamRoles.length === 0) {
         setSprintPlan(null);
         return;
       }
+      if (sprintLoading) return;
+      const numSprints = Math.max(CONFIG.minSprints, sprint?.sprints_required ?? CONFIG.minSprints);
+      const defaultRoles = buRates.map((r) => (r.role || "").trim()).filter(Boolean);
       const { rows, roles } = createInitialSprintPlanning(
-        teamRoles,
-        project.sprint_duration_weeks ?? 2,
-        2
+        team ?? [],
+        project.sprint_duration_weeks ?? CONFIG.defaultSprintDurationWeeks,
+        numSprints,
+        defaultRoles
       );
       setSprintPlan({ rows, roles });
       saveSprintPlanMutation.mutate({ rows, roles });
     }
-  }, [project, sprintPlanApiData, team]);
+  }, [project, sprintPlanApiData, team, sprint?.sprints_required, sprintLoading, version?.is_locked, buRates]);
 
   const debouncedSaveSprintPlan = useCallback(
     (data: { rows: SprintPlanningRow[]; roles: string[] }) => {
@@ -257,11 +345,36 @@ export default function ProjectDetail() {
     [saveSprintPlanMutation]
   );
 
+  const debouncedPersistFeatures = useCallback(
+    (newFeatures: FeatureCreateWithId[]) => {
+      if (saveFeaturesTimeoutRef.current) clearTimeout(saveFeaturesTimeoutRef.current);
+      saveFeaturesTimeoutRef.current = setTimeout(async () => {
+        saveFeaturesTimeoutRef.current = null;
+        const current = features ?? [];
+        const currentIds = new Set(current.map((f) => f.id));
+        const newIds = new Set(newFeatures.filter((f) => f.id != null).map((f) => f.id!));
+        for (const cf of current) {
+          if (!newIds.has(cf.id)) {
+            await featuresApi.delete(projectId, cf.id);
+          }
+        }
+        for (const nf of newFeatures) {
+          if (nf.id != null) {
+            await featuresApi.update(projectId, nf.id, nf);
+          } else {
+            await featuresApi.add(projectId, nf);
+          }
+        }
+        queryClient.invalidateQueries({ queryKey: ["features", projectId] });
+      }, 600);
+    },
+    [features, projectId, queryClient]
+  );
+
   useEffect(() => {
     return () => {
-      if (saveSprintPlanTimeoutRef.current) {
-        clearTimeout(saveSprintPlanTimeoutRef.current);
-      }
+      if (saveSprintPlanTimeoutRef.current) clearTimeout(saveSprintPlanTimeoutRef.current);
+      if (saveFeaturesTimeoutRef.current) clearTimeout(saveFeaturesTimeoutRef.current);
     };
   }, []);
 
@@ -412,6 +525,16 @@ export default function ProjectDetail() {
               <Button variant="contained" startIcon={<PersonAddIcon />} onClick={() => setShowAddMember(true)} size="medium">
                 Add Team Member
               </Button>
+              {(!team || team.length === 0) && features && features.length > 0 && (
+                <AddFromFeatureRolesButton
+                  projectId={projectId}
+                  features={features}
+                  onAdded={() => {
+                    queryClient.invalidateQueries({ queryKey: ["team", projectId] });
+                    queryClient.invalidateQueries({ queryKey: ["sprintPlan", projectId] });
+                  }}
+                />
+              )}
               {features && features.length > 0 && (
                 <Button variant="contained" startIcon={<SmartToyIcon />} onClick={() => setShowAiTeamSuggest(true)} sx={{ bgcolor: "#5856d6", "&:hover": { bgcolor: "#4846c6" } }}>
                   AI Suggest Team
@@ -436,6 +559,13 @@ export default function ProjectDetail() {
             onSubmit={(d) => addMemberMutation.mutate(d)}
             isPending={addMemberMutation.isPending}
           />
+          <EditMemberDialog
+            open={editingMember != null}
+            member={editingMember}
+            onClose={() => setEditingMember(null)}
+            onSubmit={(data) => editingMember && updateMemberMutation.mutate({ id: editingMember.id, data })}
+            isPending={updateMemberMutation.isPending}
+          />
           {team && team.length > 0 ? (
             <TableContainer component={Paper} sx={{ borderRadius: 2, border: "1px solid", borderColor: "divider", overflow: "hidden" }}>
               <Table size="medium">
@@ -446,6 +576,7 @@ export default function ProjectDetail() {
                     <TableCell align="right" sx={{ fontWeight: 600 }}>Cost /day</TableCell>
                     <TableCell align="right" sx={{ fontWeight: 600 }}>Billing /day</TableCell>
                     <TableCell align="right" sx={{ fontWeight: 600 }}>Utilization</TableCell>
+                    {canEditTeam && !isLocked && <TableCell sx={{ width: 100 }} />}
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -456,6 +587,16 @@ export default function ProjectDetail() {
                       <TableCell align="right">{m.cost_rate_per_day != null ? m.cost_rate_per_day.toLocaleString() : "—"}</TableCell>
                       <TableCell align="right">{m.billing_rate_per_day != null ? m.billing_rate_per_day.toLocaleString() : "—"}</TableCell>
                       <TableCell align="right">{m.utilization_pct}%</TableCell>
+                      {canEditTeam && !isLocked && (
+                        <TableCell>
+                          <IconButton size="small" onClick={() => setEditingMember(m)} title="Edit">
+                            <EditIcon fontSize="small" />
+                          </IconButton>
+                          <IconButton size="small" onClick={() => deleteMemberMutation.mutate(m.id)} title="Delete">
+                            <DeleteOutlineIcon fontSize="small" />
+                          </IconButton>
+                        </TableCell>
+                      )}
                     </TableRow>
                   ))}
                 </TableBody>
@@ -504,56 +645,29 @@ export default function ProjectDetail() {
             isPending={addFeatureMutation.isPending}
           />
           {features && features.length > 0 ? (
-            <TableContainer component={Paper} sx={{ borderRadius: 2, border: "1px solid", borderColor: "divider", overflow: "hidden" }}>
-              <Table size="medium">
-                <TableHead>
-                  <TableRow sx={{ bgcolor: "action.hover" }}>
-                    <TableCell sx={{ fontWeight: 600, width: 48 }}>#</TableCell>
-                    <TableCell sx={{ fontWeight: 600 }}>Feature</TableCell>
-                    <TableCell sx={{ fontWeight: 600 }}>Tasks</TableCell>
-                    <TableCell align="right" sx={{ fontWeight: 600 }}>Effort (hrs)</TableCell>
-                    <TableCell align="right" sx={{ fontWeight: 600 }}>Priority</TableCell>
-                    <TableCell sx={{ fontWeight: 600 }}>Role</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {features.map((f, idx) => {
-                    const primaryRole = f.effort_allocations?.length
-                      ? f.effort_allocations.reduce((a, b) => (b.allocation_pct > a.allocation_pct ? b : a)).role
-                      : f.tasks?.[0]?.role ?? "-";
-                    return (
-                    <TableRow key={f.id} hover>
-                      <TableCell>{idx + 1}</TableCell>
-                      <TableCell>
-                        <Typography fontWeight={500}>{f.name}</Typography>
-                        {f.description && (
-                          <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.25 }}>
-                            {f.description}
-                          </Typography>
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        {f.tasks && f.tasks.length > 0 ? (
-                          <Box component="ul" sx={{ m: 0, pl: 2, fontSize: "0.875rem" }}>
-                            {f.tasks.map((t, i) => (
-                              <li key={i}>
-                                {t.name} — {t.effort_hours}h ({t.role})
-                              </li>
-                            ))}
-                          </Box>
-                        ) : (
-                          <Typography variant="body2" color="text.secondary">—</Typography>
-                        )}
-                      </TableCell>
-                      <TableCell align="right">{f.effort_hours}</TableCell>
-                      <TableCell align="right">{f.priority}</TableCell>
-                      <TableCell>{primaryRole}</TableCell>
-                    </TableRow>
-                  );
-                  })}
-                </TableBody>
-              </Table>
-            </TableContainer>
+            <Box sx={{ mb: 2, width: "100%", minWidth: 0 }}>
+              <FeaturesTasksGrid
+                features={features.map(featureToCreateWithId)}
+                onChange={(newFeatures) => {
+                  if (canEditFeatures && !isLocked) debouncedPersistFeatures(newFeatures);
+                }}
+                project={project}
+                version={version}
+                team={team ?? []}
+                onContingencyChange={(pct) => {
+                  versionsApi.update(projectId, version!.id, { contingency_pct: pct }).then(() => {
+                    queryClient.invalidateQueries({ queryKey: ["version", projectId] });
+                    queryClient.invalidateQueries({ queryKey: ["cost", projectId] });
+                    queryClient.invalidateQueries({ queryKey: ["profitability", projectId] });
+                    queryClient.invalidateQueries({ queryKey: ["sprint", projectId] });
+                    queryClient.invalidateQueries({ queryKey: ["reverseMargin", projectId] });
+                  });
+                }}
+                readOnly={isLocked || !canEditFeatures}
+                minHeight={320}
+                autoHeight
+              />
+            </Box>
           ) : (
             <Paper sx={{ p: 6, textAlign: "center", border: "2px dashed", borderColor: "divider", borderRadius: 2 }}>
               <Typography variant="h6" gutterBottom fontWeight={600}>No features yet</Typography>
@@ -572,10 +686,12 @@ export default function ProjectDetail() {
             <SprintPlanningGrid
               rows={sprintPlan.rows}
               roles={sprintPlan.roles}
-              sprintDurationWeeks={project.sprint_duration_weeks ?? 2}
+              sprintDurationWeeks={project.sprint_duration_weeks ?? CONFIG.defaultSprintDurationWeeks}
               isLocked={isLocked}
+              roleCapacity={computeRoleCapacity(team ?? [])}
               onRowsChange={(rows) => {
-                const next = { ...sprintPlan, rows };
+                const sorted = ensurePhasesAtEnd(rows);
+                const next = { ...sprintPlan, rows: sorted };
                 setSprintPlan(next);
                 if (!isLocked) debouncedSaveSprintPlan(next);
               }}
@@ -872,6 +988,10 @@ function AiUploadAndSuggest({
                 onContingencyChange={(pct) => {
                   versionsApi.update(projectId, version.id, { contingency_pct: pct }).then(() => {
                     queryClient.invalidateQueries({ queryKey: ["version", projectId] });
+                    queryClient.invalidateQueries({ queryKey: ["cost", projectId] });
+                    queryClient.invalidateQueries({ queryKey: ["profitability", projectId] });
+                    queryClient.invalidateQueries({ queryKey: ["sprint", projectId] });
+                    queryClient.invalidateQueries({ queryKey: ["reverseMargin", projectId] });
                   });
                 }}
                 minHeight={320}
@@ -1062,6 +1182,63 @@ function DocumentUploadZone({
   );
 }
 
+function AddFromFeatureRolesButton({
+  projectId,
+  features,
+  onAdded,
+}: {
+  projectId: number;
+  features: Feature[];
+  onAdded: () => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const { data: buRates = [] } = useQuery({ queryKey: ["buRates"], queryFn: () => buRatesApi.list() });
+  const buByRole = useMemo(
+    () => Object.fromEntries(buRates.map((r) => [(r.role || "").trim(), r]).filter(([k]) => k)),
+    [buRates]
+  );
+  const rolesFromFeatures = useMemo(() => {
+    const roles = new Set<string>();
+    for (const f of features) {
+      if (f.tasks) for (const t of f.tasks) if ((t.role || "").trim()) roles.add((t.role || "").trim());
+      if (f.effort_allocations)
+        for (const a of f.effort_allocations) if ((a.role || "").trim()) roles.add((a.role || "").trim());
+    }
+    return [...roles].sort();
+  }, [features]);
+  const handleAdd = async () => {
+    if (rolesFromFeatures.length === 0) return;
+    setLoading(true);
+    try {
+      for (const role of rolesFromFeatures) {
+        const bu = buByRole[role] ?? Object.values(buByRole).find((r) => r.role.toLowerCase() === role.toLowerCase());
+        await teamApi.add(projectId, {
+          role,
+          member_name: undefined,
+          cost_rate_per_day: bu?.cost_rate_per_day,
+          billing_rate_per_day: bu?.billing_rate_per_day,
+          utilization_pct: CONFIG.fullTimeUtilizationPct,
+          working_days_per_month: CONFIG.defaultWorkingDaysPerMonth,
+          hours_per_day: CONFIG.defaultHoursPerDay,
+        });
+      }
+      onAdded();
+    } finally {
+      setLoading(false);
+    }
+  };
+  return (
+    <Button
+      variant="outlined"
+      onClick={handleAdd}
+      disabled={loading || rolesFromFeatures.length === 0}
+      sx={{ borderStyle: "dashed" }}
+    >
+      {loading ? "Adding..." : `Add team from feature roles (${rolesFromFeatures.length})`}
+    </Button>
+  );
+}
+
 function AddMemberDialog({
   open,
   onClose,
@@ -1078,16 +1255,16 @@ function AddMemberDialog({
     member_name: "",
     cost_rate_per_day: undefined,
     billing_rate_per_day: undefined,
-    utilization_pct: 80,
-    working_days_per_month: 20,
-    hours_per_day: 8,
+    utilization_pct: CONFIG.fullTimeUtilizationPct,
+    working_days_per_month: CONFIG.defaultWorkingDaysPerMonth,
+    hours_per_day: CONFIG.defaultHoursPerDay,
   });
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     onSubmit(form);
   };
   useEffect(() => {
-    if (!open) setForm({ role: "", member_name: "", cost_rate_per_day: undefined, billing_rate_per_day: undefined, utilization_pct: 80, working_days_per_month: 20, hours_per_day: 8 });
+    if (!open) setForm({ role: "", member_name: "", cost_rate_per_day: undefined, billing_rate_per_day: undefined, utilization_pct: CONFIG.fullTimeUtilizationPct, working_days_per_month: CONFIG.defaultWorkingDaysPerMonth, hours_per_day: CONFIG.defaultHoursPerDay });
   }, [open]);
   return (
     <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth PaperProps={{ sx: { borderRadius: 3 } }}>
@@ -1105,7 +1282,7 @@ function AddMemberDialog({
             />
             <TextField
               label="Name"
-              placeholder="Optional"
+              placeholder="Optional, can update later"
               value={form.member_name || ""}
               onChange={(e) => setForm({ ...form, member_name: e.target.value })}
             />
@@ -1131,9 +1308,9 @@ function AddMemberDialog({
               label="Utilization %"
               type="number"
               inputProps={{ min: 1, max: 100 }}
-              value={form.utilization_pct || ""}
+              value={form.utilization_pct ?? ""}
               onChange={(e) => setForm({ ...form, utilization_pct: Number(e.target.value) })}
-              helperText="80% = 4 days/week"
+              helperText="100% = full-time on project"
             />
             <Box sx={{ display: "flex", gap: 1 }}>
               <TextField
@@ -1141,7 +1318,7 @@ function AddMemberDialog({
                 type="number"
                 size="small"
                 inputProps={{ min: 1, max: 31 }}
-                value={form.working_days_per_month || ""}
+                value={form.working_days_per_month ?? ""}
                 onChange={(e) => setForm({ ...form, working_days_per_month: Number(e.target.value) })}
                 sx={{ flex: 1 }}
               />
@@ -1150,7 +1327,7 @@ function AddMemberDialog({
                 type="number"
                 size="small"
                 inputProps={{ min: 1, max: 24 }}
-                value={form.hours_per_day || ""}
+                value={form.hours_per_day ?? ""}
                 onChange={(e) => setForm({ ...form, hours_per_day: Number(e.target.value) })}
                 sx={{ flex: 1 }}
               />
@@ -1161,6 +1338,120 @@ function AddMemberDialog({
           <Button onClick={onClose}>Cancel</Button>
           <Button type="submit" variant="contained" disabled={isPending || !form.role.trim()}>
             {isPending ? "Adding..." : "Add Member"}
+          </Button>
+        </DialogActions>
+      </form>
+    </Dialog>
+  );
+}
+
+function EditMemberDialog({
+  open,
+  member,
+  onClose,
+  onSubmit,
+  isPending,
+}: {
+  open: boolean;
+  member: TeamMember | null;
+  onClose: () => void;
+  onSubmit: (d: Partial<TeamMemberCreate>) => void;
+  isPending: boolean;
+}) {
+  const [form, setForm] = useState<Partial<TeamMemberCreate>>({});
+  useEffect(() => {
+    if (member) {
+      setForm({
+        role: member.role,
+        member_name: member.member_name ?? "",
+        cost_rate_per_day: member.cost_rate_per_day,
+        billing_rate_per_day: member.billing_rate_per_day,
+        utilization_pct: member.utilization_pct,
+        working_days_per_month: member.working_days_per_month,
+        hours_per_day: member.hours_per_day,
+      });
+    }
+  }, [member]);
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const payload: Partial<TeamMemberCreate> = {
+      role: (form.role ?? "").trim() || undefined,
+      member_name: (form.member_name ?? "").trim(),
+      cost_rate_per_day: form.cost_rate_per_day != null && form.cost_rate_per_day !== "" ? Number(form.cost_rate_per_day) : undefined,
+      billing_rate_per_day: form.billing_rate_per_day != null && form.billing_rate_per_day !== "" ? Number(form.billing_rate_per_day) : undefined,
+      utilization_pct: form.utilization_pct != null && form.utilization_pct !== "" ? Number(form.utilization_pct) : undefined,
+      working_days_per_month: form.working_days_per_month != null && form.working_days_per_month !== "" ? Number(form.working_days_per_month) : undefined,
+      hours_per_day: form.hours_per_day != null && form.hours_per_day !== "" ? Number(form.hours_per_day) : undefined,
+    };
+    Object.keys(payload).forEach((k) => (payload as Record<string, unknown>)[k] === undefined && delete (payload as Record<string, unknown>)[k]);
+    onSubmit(payload);
+  };
+  if (!member) return null;
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth PaperProps={{ sx: { borderRadius: 3 } }}>
+      <DialogTitle>Edit Team Member</DialogTitle>
+      <form onSubmit={handleSubmit}>
+        <DialogContent>
+          <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 2, pt: 1 }}>
+            <TextField
+              label="Role"
+              required
+              value={form.role ?? ""}
+              onChange={(e) => setForm({ ...form, role: e.target.value })}
+            />
+            <TextField
+              label="Name"
+              placeholder="Optional"
+              value={form.member_name ?? ""}
+              onChange={(e) => setForm({ ...form, member_name: e.target.value })}
+            />
+            <TextField
+              label="Cost /day"
+              type="number"
+              inputProps={{ min: 0, step: 10 }}
+              value={form.cost_rate_per_day ?? ""}
+              onChange={(e) => setForm({ ...form, cost_rate_per_day: e.target.value ? Number(e.target.value) : undefined })}
+            />
+            <TextField
+              label="Billing /day"
+              type="number"
+              inputProps={{ min: 0, step: 10 }}
+              value={form.billing_rate_per_day ?? ""}
+              onChange={(e) => setForm({ ...form, billing_rate_per_day: e.target.value ? Number(e.target.value) : undefined })}
+            />
+            <TextField
+              label="Utilization %"
+              type="number"
+              inputProps={{ min: 1, max: 100 }}
+              value={form.utilization_pct ?? ""}
+              onChange={(e) => setForm({ ...form, utilization_pct: Number(e.target.value) })}
+            />
+            <Box sx={{ display: "flex", gap: 1 }}>
+              <TextField
+                label="Days/month"
+                type="number"
+                size="small"
+                inputProps={{ min: 1, max: 31 }}
+                value={form.working_days_per_month ?? ""}
+                onChange={(e) => setForm({ ...form, working_days_per_month: Number(e.target.value) })}
+                sx={{ flex: 1 }}
+              />
+              <TextField
+                label="Hrs/day"
+                type="number"
+                size="small"
+                inputProps={{ min: 1, max: 24 }}
+                value={form.hours_per_day ?? ""}
+                onChange={(e) => setForm({ ...form, hours_per_day: Number(e.target.value) })}
+                sx={{ flex: 1 }}
+              />
+            </Box>
+          </Box>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={onClose}>Cancel</Button>
+          <Button type="submit" variant="contained" disabled={isPending || !(form.role ?? "").trim()}>
+            {isPending ? "Saving..." : "Save"}
           </Button>
         </DialogActions>
       </form>

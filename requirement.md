@@ -322,6 +322,12 @@ New Requirement:
 
 
 
+Sprint Planning — Steps:
+1. Total effort (from features + task contingency + version contingency)
+2. Sprint weeks (from project creation — sprint_duration_weeks)
+3. Total sprints = ceil(total_effort / sprint_capacity)
+4. Generate table with sprints_required rows, cells = role capacity (1=100%, 0.5=50%, etc.)
+
 Sprint Planning Format:
 
                     Technical Architect     Project Manager     QA  etc. 

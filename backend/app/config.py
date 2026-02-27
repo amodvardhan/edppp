@@ -33,6 +33,17 @@ class Settings(BaseSettings):
     margin_threshold_warning: float = 15.0
     effort_override_threshold: float = 15.0
 
+    # Sprint/effort defaults (used when sprint_config or project data missing)
+    default_working_days_per_month: int = 20
+    default_sprint_duration_weeks: int = 2
+    default_hours_per_day: int = 8
+    default_utilization_pct: float = 80.0
+
+    # Task contingency by seniority (Jr=1.15, Sr=1.05, default=1.10)
+    task_contingency_junior: float = 1.15
+    task_contingency_senior: float = 1.05
+    task_contingency_default: float = 1.10
+
     @property
     def cors_origins_list(self) -> List[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

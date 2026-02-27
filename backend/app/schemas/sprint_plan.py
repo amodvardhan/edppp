@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 class SprintPlanRowSchema(BaseModel):
     id: str
-    type: Literal["sprint-week", "phase"]
+    type: Literal["sprint-week", "sprint", "phase"]
     sprint_num: int | None = None
     week_num: int | None = None
     phase: Literal["pre_uat", "uat", "go_live"] | None = None
