@@ -205,8 +205,11 @@ export default function ProjectDetail() {
         })),
         roles: data.roles,
       }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["sprintPlan", projectId] });
+    onSuccess: (saved) => {
+      queryClient.setQueryData(
+        ["sprintPlan", projectId],
+        saved
+      );
     },
   });
 
@@ -272,8 +275,20 @@ export default function ProjectDetail() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["version", projectId] }),
   });
 
+  const lastProcessedRef = React.useRef<string | null>(null);
+  useEffect(() => {
+    lastProcessedRef.current = null;
+  }, [projectId]);
+
   useEffect(() => {
     if (!project || !sprintPlanApiData) return;
+    const cacheKey = JSON.stringify({
+      rows: sprintPlanApiData.rows.length,
+      roles: sprintPlanApiData.roles,
+    });
+    if (lastProcessedRef.current === cacheKey) return;
+    lastProcessedRef.current = cacheKey;
+
     if (sprintPlanApiData.rows.length > 0) {
       const apiRows = sprintPlanApiData.rows.map(fromApiRow);
       const roleCapacity = computeRoleCapacity(team ?? []);
@@ -301,6 +316,7 @@ export default function ProjectDetail() {
         } else {
           setSprintPlan(null);
         }
+        lastProcessedRef.current = null;
         return;
       }
       const sorted = ensurePhasesAtEnd(migrated);
@@ -316,6 +332,7 @@ export default function ProjectDetail() {
       const teamRoles = team?.map((m) => m.role) ?? [];
       if (teamRoles.length === 0) {
         setSprintPlan(null);
+        lastProcessedRef.current = null;
         return;
       }
       if (sprintLoading) return;
