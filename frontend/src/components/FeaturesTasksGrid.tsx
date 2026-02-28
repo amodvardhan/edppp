@@ -46,11 +46,12 @@ function featuresToRows(features: FeatureCreateWithId[], roleOptions: string[]):
       const taskRole = String(t.role ?? "").trim();
       const aiSuggested = taskRole || "";
       const selectedBuRole = roleOptions.length > 0 ? matchRoleToBu(taskRole, roleOptions) : "";
+      const hrs = Number(t.effort_hours) || 0;
       rows.push({
         id: ++id,
         feature: f.name,
         task: t.name,
-        hours: t.effort_hours,
+        hours: hrs,
         aiSuggestedRole: aiSuggested,
         role: selectedBuRole,
         priority,
@@ -72,11 +73,15 @@ function rowsToFeatures(rows: GridRow[]): FeatureCreateWithId[] {
   for (const [name, taskRows] of byFeature) {
     const tasks: FeatureTask[] = taskRows
       .filter((r: GridRow) => String(r.task || "").trim())
-      .map((r: GridRow) => ({
-        name: r.task,
-        effort_hours: Number(r.hours) || 0,
-        role: String(r.role || r.aiSuggestedRole || "").trim() || "Unassigned",
-      }));
+      .map((r: GridRow) => {
+        const hrs = Number(r.hours) || 0;
+        return {
+          name: r.task,
+          effort_hours: hrs,
+          role: String(r.role || r.aiSuggestedRole || "").trim() || "Unassigned",
+          fte: computeFte(hrs),
+        };
+      });
     const effort_hours = taskRows.reduce((s: number, r: GridRow) => s + (Number(r.hours) || 0), 0);
     const priority = Number(taskRows[0]?.priority) || 1;
     const featureId = taskRows[0]?.featureId;
@@ -90,6 +95,7 @@ function rowsToFeatures(rows: GridRow[]): FeatureCreateWithId[] {
       role,
       allocation_pct: Math.round((hrs / totalHrs) * 10000) / 100,
       effort_hours: hrs,
+      fte: computeFte(hrs),
     }));
     features.push({
       ...(featureId != null && { id: featureId }),
@@ -111,6 +117,20 @@ function rowGrouper(rows: readonly GridRow[], columnKey: string): Record<string,
     map[key].push(r);
   }
   return map;
+}
+
+/** Hours per FTE-month: 20 days * 8 hrs * 80% utilization = 128 */
+function hoursPerFteMonth(): number {
+  return (
+    CONFIG.defaultWorkingDaysPerMonth *
+    CONFIG.defaultHoursPerDay *
+    (CONFIG.defaultUtilizationPct / 100)
+  );
+}
+
+function computeFte(effortHours: number): number {
+  const hpf = hoursPerFteMonth();
+  return hpf > 0 ? Math.round((effortHours / hpf) * 10000) / 10000 : 0;
 }
 
 /** Task-level contingency multiplier by role seniority - from config. */
@@ -444,8 +464,8 @@ export default function FeaturesTasksGrid({
   const colWidths = useMemo(() => {
     const w = containerWidth - (readOnly ? 0 : 44);
     return {
-      feature: Math.max(180, Math.floor(w * 0.24)),
-      task: Math.max(180, Math.floor(w * 0.24)),
+      feature: Math.max(180, Math.floor(w * 0.22)),
+      task: Math.max(180, Math.floor(w * 0.22)),
       hours: 80,
       role: 140,
       baseRate: 95,
@@ -455,16 +475,18 @@ export default function FeaturesTasksGrid({
   }, [containerWidth, readOnly]);
 
   const roleSummary = useMemo(() => {
-    const byRole: Record<string, { hours: number; cost: number }> = {};
+    const byRole: Record<string, { hours: number; fte: number; cost: number }> = {};
     for (const r of rows) {
       const role = r.role.trim() || "(Unassigned)";
       const baseHrs = Number(r.hours) || 0;
       const mult = getTaskContingencyMultiplier(r.role || r.aiSuggestedRole);
       const effectiveHrs = baseHrs * mult;
+      const fte = computeFte(baseHrs);
       const ratePerDay = getRateForRole(r.role, baseRatePerDay);
       const cost = ratePerDay > 0 ? effectiveHrs * (ratePerDay / HOURS_PER_DAY) : 0;
-      if (!byRole[role]) byRole[role] = { hours: 0, cost: 0 };
+      if (!byRole[role]) byRole[role] = { hours: 0, fte: 0, cost: 0 };
       byRole[role].hours += effectiveHrs;
+      byRole[role].fte += fte;
       byRole[role].cost += cost;
     }
     return Object.entries(byRole).sort((a, b) => b[1].hours - a[1].hours);
@@ -525,6 +547,18 @@ export default function FeaturesTasksGrid({
         editable: !readOnly,
         resizable: true,
         renderEditCell: NumberEditor,
+      },
+      {
+        key: "fte",
+        name: "FTE",
+        minWidth: 70,
+        width: 70,
+        resizable: true,
+        renderCell: ({ row }) => {
+          const hrs = Number(row.hours) || 0;
+          const fte = computeFte(hrs);
+          return fte > 0 ? fte.toFixed(2).replace(/\.?0+$/, "") : "—";
+        },
       },
       {
         key: "role",
@@ -702,21 +736,22 @@ export default function FeaturesTasksGrid({
         <Box sx={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
           <Box sx={{ minWidth: 200 }}>
             <Typography variant="caption" color="text.secondary" display="block">
-              Role summary
+              Role summary (Hours · FTE · Cost)
             </Typography>
             <Box component="table" sx={{ fontSize: "0.8125rem", mt: 0.5 }}>
               <tbody>
                 {roleSummary.length > 0 ? (
-                  roleSummary.map(([role, { hours, cost }]) => (
+                  roleSummary.map(([role, { hours, fte, cost }]) => (
                     <tr key={role}>
                       <td style={{ paddingRight: 16 }}>{role}</td>
                       <td style={{ paddingRight: 16 }}>{hours.toFixed(1)}h</td>
+                      <td style={{ paddingRight: 16 }}>{fte > 0 ? fte.toFixed(2).replace(/\.?0+$/, "") : "—"}</td>
                       <td>{cost > 0 ? formatCurrency(cost, currency) : "—"}</td>
                     </tr>
                   ))
                 ) : (
                   <tr>
-                    <td colSpan={3} style={{ color: theme.palette.text.secondary }}>
+                    <td colSpan={4} style={{ color: theme.palette.text.secondary }}>
                       Configure BU rates (Settings) for roles. Base Rate uses BU Billing/Day.
                     </td>
                   </tr>

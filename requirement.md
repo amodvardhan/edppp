@@ -51,6 +51,7 @@ Utilization	Effective productive percentage
 Sprint	Configurable timebox iteration
 Margin	(Revenue - Cost) / Revenue
 Version	Immutable snapshot of project plan
+FTE (Full-Time Equivalent)	Project-level: team capacity per role (utilization_pct/100, summed by role). Drives sprint plan. Display: 2 decimal places.
 4. SYSTEM OVERVIEW
 4.1 Actors
 Admin
@@ -327,13 +328,15 @@ Sprint Planning — Steps:
 2. Sprint weeks (from project creation — sprint_duration_weeks)
 3. Total sprints = ceil(total_effort / sprint_capacity)
 4. Generate table with sprints_required rows, cells = role capacity (1=100%, 0.5=50%, etc.)
+5. Sprint plan is driven by **project-level FTE** (team composition); see FR-FTE below.
 
 Sprint Planning Format:
 
                     Technical Architect     Project Manager     QA  etc. 
+FTE (capacity)      1                       0.5                1
 Sprint 1 
-         Week 1         1                       1               1
-         Week 2         1                       1               1
+         Week 1         1                       0.5              1
+         Week 2         1                       0.5              1
 Sprint 2 
         Week 1          1                       .5              1
         Week 2          1                       .5              1
@@ -342,4 +345,12 @@ Sprint 2
 Pre UAT 
 UAT
 Go Live
+
+---
+
+FR-FTE: FTE (Full-Time Equivalent) Requirements
+- **Display precision**: FTE values shall be displayed with 2 decimal places (e.g. 0.09, 1.50).
+- **Project-level FTE**: FTE is defined at the project level via team composition. Each team member contributes FTE = utilization_pct / 100 (e.g. 80% → 0.8 FTE). Multiple members with the same role sum to that role's total FTE.
+- **Sprint plan driven by project FTE**: The sprint allocation plan shall use project-level FTE (role capacity) as the basis. The "FTE (capacity)" row in the sprint planning table shows the project-level FTE per role. New sprints and phases are pre-filled with these values.
+- **Task-level FTE (derived)**: Task/effort allocation FTE = effort_hours / 128 (person-months) is a derived metric for cost and roll-up. Display with 2 decimals.
 

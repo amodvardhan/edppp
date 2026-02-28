@@ -123,7 +123,7 @@ async def delete_project(
     version = version_result.scalar_one_or_none()
     if not version:
         raise HTTPException(status_code=404, detail="Project not found")
-    if version.status != ProjectStatus.DRAFT.value or version.is_locked:
+    if version.status != ProjectStatus.DRAFT or version.is_locked:
         raise HTTPException(
             status_code=400,
             detail="Cannot delete project: only draft projects can be deleted",

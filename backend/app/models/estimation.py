@@ -20,6 +20,7 @@ class EffortAllocation(Base):
     role: Mapped[str] = mapped_column(String(100), nullable=False)
     allocation_pct: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
     effort_hours: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    fte: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
 
     feature: Mapped["Feature"] = relationship("Feature", back_populates="effort_allocations")
 

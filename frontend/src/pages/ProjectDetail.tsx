@@ -87,8 +87,9 @@ function featureToCreateWithId(f: Feature): FeatureCreateWithId {
       role: a.role,
       allocation_pct: a.allocation_pct,
       effort_hours: a.effort_hours,
+      fte: a.fte,
     })),
-    tasks: f.tasks?.map((t) => ({ name: t.name, effort_hours: t.effort_hours, role: t.role })),
+    tasks: f.tasks?.map((t) => ({ name: t.name, effort_hours: t.effort_hours, role: t.role, fte: t.fte })),
   };
 }
 
@@ -284,10 +285,25 @@ export default function ProjectDetail() {
     }
     const sorted = ensurePhasesAtEnd(migrated);
     const needsMigration = apiRows.some((r) => r.type === "sprint-week" && r.weekNum != null);
-    setSprintPlan({ rows: sorted, roles: sprintPlanApiData.roles });
-    if (needsMigration && !(version?.is_locked ?? false)) {
-      queryClient.setQueryData(["sprintPlan", projectId], { rows: sorted.map(toApiRow), roles: sprintPlanApiData.roles });
-      saveSprintPlanMutation.mutate({ rows: sorted, roles: sprintPlanApiData.roles });
+    // Merge team roles into sprint plan so newly added team members appear as columns
+    const teamRoles = [...new Set((team ?? []).map((m) => (m.role || "").trim()).filter(Boolean))];
+    const savedRoles = sprintPlanApiData.roles ?? [];
+    const newRolesFromTeam = teamRoles.filter((r) => !savedRoles.includes(r));
+    const mergedRoles = newRolesFromTeam.length > 0 ? [...savedRoles, ...newRolesFromTeam] : savedRoles;
+    const rowsWithNewRoles =
+      newRolesFromTeam.length > 0
+        ? sorted.map((r) => {
+            const values = { ...r.values };
+            for (const role of newRolesFromTeam) {
+              values[role] = roleCapacity[role] ?? 0;
+            }
+            return { ...r, values };
+          })
+        : sorted;
+    setSprintPlan({ rows: rowsWithNewRoles, roles: mergedRoles });
+    if ((needsMigration || newRolesFromTeam.length > 0) && !(version?.is_locked ?? false)) {
+      queryClient.setQueryData(["sprintPlan", projectId], { rows: rowsWithNewRoles.map(toApiRow), roles: mergedRoles });
+      saveSprintPlanMutation.mutate({ rows: rowsWithNewRoles, roles: mergedRoles });
     }
   }, [project, sprintPlanApiData, team, sprint?.sprints_required, sprintLoading, version?.is_locked, buRates, projectId, queryClient, saveSprintPlanMutation]);
 

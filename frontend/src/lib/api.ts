@@ -409,6 +409,7 @@ export interface FeatureTask {
   name: string;
   effort_hours: number;
   role: string;
+  fte?: number;
 }
 
 export interface Feature {
@@ -421,7 +422,7 @@ export interface Feature {
   effort_story_points?: number;
   ai_suggested_effort?: number;
   ai_suggested_approved: boolean;
-  effort_allocations: { id: number; role: string; allocation_pct: number; effort_hours: number }[];
+  effort_allocations: { id: number; role: string; allocation_pct: number; effort_hours: number; fte?: number }[];
   tasks?: FeatureTask[];
 }
 
@@ -431,6 +432,6 @@ export interface FeatureCreate {
   priority?: number;
   effort_hours: number;
   effort_story_points?: number;
-  effort_allocations?: { role: string; allocation_pct: number; effort_hours: number }[];
+  effort_allocations?: { role: string; allocation_pct: number; effort_hours: number; fte?: number }[];
   tasks?: FeatureTask[];
 }

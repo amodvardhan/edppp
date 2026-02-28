@@ -27,7 +27,7 @@ from app.schemas.feature import (
     FeatureTaskResponse,
     FeatureUpdate,
 )
-from app.services.ai_service import estimate_features_from_requirements
+from app.services.ai_service import compute_fte, estimate_features_from_requirements
 from app.services.document_extractor import extract_text_from_file
 
 router = APIRouter(prefix="/projects", tags=["features"])
@@ -37,7 +37,12 @@ def _tasks_to_response(tasks: list | None) -> list:
     if not tasks:
         return []
     return [
-        FeatureTaskResponse(name=t.get("name", ""), effort_hours=Decimal(str(t.get("effort_hours", 0))), role=t.get("role", "Developer"))
+        FeatureTaskResponse(
+            name=t.get("name", ""),
+            effort_hours=Decimal(str(t.get("effort_hours", 0))),
+            role=t.get("role", "Developer"),
+            fte=Decimal(str(t["fte"])).quantize(Decimal("0.0001")) if t.get("fte") is not None else compute_fte(Decimal(str(t.get("effort_hours", 0)))),
+        )
         for t in tasks
     ]
 
@@ -81,7 +86,7 @@ async def list_features(
             effort_story_points=f.effort_story_points,
             ai_suggested_effort=f.ai_suggested_effort,
             ai_suggested_approved=f.ai_suggested_approved,
-            effort_allocations=[{"id": a.id, "role": a.role, "allocation_pct": a.allocation_pct, "effort_hours": a.effort_hours} for a in (f.effort_allocations or [])],
+            effort_allocations=[{"id": a.id, "role": a.role, "allocation_pct": a.allocation_pct, "effort_hours": a.effort_hours, "fte": a.fte} for a in (f.effort_allocations or [])],
             tasks=_tasks_to_response(f.tasks),
         )
         for f in features
@@ -99,7 +104,15 @@ async def add_feature(
     if not can_edit_features(roles):
         raise HTTPException(status_code=403, detail="Cannot edit features")
     version = await _get_version(db, project_id)
-    tasks_data = [{"name": t.name, "effort_hours": float(t.effort_hours), "role": t.role} for t in (data.tasks or [])]
+    tasks_data = [
+        {
+            "name": t.name,
+            "effort_hours": float(t.effort_hours),
+            "role": t.role,
+            "fte": float(t.fte) if t.fte is not None else float(compute_fte(t.effort_hours)),
+        }
+        for t in (data.tasks or [])
+    ]
     feature = Feature(
         version_id=version.id,
         name=data.name,
@@ -112,11 +125,13 @@ async def add_feature(
     db.add(feature)
     await db.flush()
     for a in data.effort_allocations:
+        fte_val = a.fte if a.fte is not None else compute_fte(a.effort_hours)
         db.add(EffortAllocation(
             feature_id=feature.id,
             role=a.role,
             allocation_pct=a.allocation_pct,
             effort_hours=a.effort_hours,
+            fte=fte_val,
         ))
     db.add(AuditLog(
         project_id=project_id,
@@ -144,7 +159,7 @@ async def add_feature(
         effort_story_points=f.effort_story_points,
         ai_suggested_effort=f.ai_suggested_effort,
         ai_suggested_approved=f.ai_suggested_approved,
-        effort_allocations=[{"id": a.id, "role": a.role, "allocation_pct": a.allocation_pct, "effort_hours": a.effort_hours} for a in (f.effort_allocations or [])],
+        effort_allocations=[{"id": a.id, "role": a.role, "allocation_pct": a.allocation_pct, "effort_hours": a.effort_hours, "fte": a.fte} for a in (f.effort_allocations or [])],
         tasks=_tasks_to_response(f.tasks),
     )
 
@@ -261,15 +276,24 @@ async def update_feature(
         for a in feature.effort_allocations or []:
             await db.delete(a)
         for a in data.effort_allocations:
+            fte_val = a.fte if a.fte is not None else compute_fte(a.effort_hours)
             db.add(EffortAllocation(
                 feature_id=feature.id,
                 role=a.role,
                 allocation_pct=a.allocation_pct,
                 effort_hours=a.effort_hours,
+                fte=fte_val,
             ))
     if data.tasks is not None:
-        feature.tasks = [{"name": t.name, "effort_hours": float(t.effort_hours), "role": t.role} for t in data.tasks]
-        # Derive effort_allocations from tasks so cost calculation uses correct roles
+        feature.tasks = [
+            {
+                "name": t.name,
+                "effort_hours": float(t.effort_hours),
+                "role": t.role,
+                "fte": float(t.fte) if t.fte is not None else float(compute_fte(t.effort_hours)),
+            }
+            for t in data.tasks
+        ]
         role_hours: dict[str, Decimal] = {}
         for t in data.tasks:
             r = (t.role or "").strip() or "Unassigned"
@@ -285,6 +309,7 @@ async def update_feature(
                     role=role,
                     allocation_pct=pct,
                     effort_hours=hrs,
+                    fte=compute_fte(hrs),
                 )
             )
 
@@ -313,7 +338,7 @@ async def update_feature(
         effort_story_points=f.effort_story_points,
         ai_suggested_effort=f.ai_suggested_effort,
         ai_suggested_approved=f.ai_suggested_approved,
-        effort_allocations=[{"id": a.id, "role": a.role, "allocation_pct": a.allocation_pct, "effort_hours": a.effort_hours} for a in (f.effort_allocations or [])],
+        effort_allocations=[{"id": a.id, "role": a.role, "allocation_pct": a.allocation_pct, "effort_hours": a.effort_hours, "fte": a.fte} for a in (f.effort_allocations or [])],
         tasks=_tasks_to_response(f.tasks),
     )
 

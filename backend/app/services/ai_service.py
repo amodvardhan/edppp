@@ -10,6 +10,22 @@ from app.schemas.feature import EffortAllocationCreate, FeatureCreate, FeatureTa
 from app.schemas.team import TeamMemberCreate
 
 
+def _hours_per_fte_month() -> Decimal:
+    """Hours per FTE-month: working_days * hours_per_day * utilization_pct/100."""
+    s = get_settings()
+    return Decimal(s.default_working_days_per_month) * Decimal(s.default_hours_per_day) * (
+        Decimal(str(s.default_utilization_pct)) / Decimal(100)
+    )
+
+
+def compute_fte(effort_hours: Decimal) -> Decimal:
+    """Compute FTE from effort_hours using standard defaults (20 days, 8 hrs, 80% util)."""
+    hpf = _hours_per_fte_month()
+    if hpf <= 0:
+        return Decimal(0)
+    return (effort_hours / hpf).quantize(Decimal("0.0001"))
+
+
 FEATURE_EXTRACTION_PROMPT = """You are an expert software delivery estimator and business analyst. Your task is to extract a detailed feature breakdown from requirement documents (SOW, ToR, user stories, PRD, etc.).
 
 ## Output Format
@@ -23,11 +39,18 @@ Return a JSON array of features. Each feature MUST have exactly these fields:
   - name: string (specific deliverable or work item)
   - effort_hours: number (realistic hours for this task)
   - role: string (primary role doing this work)
+  - fte: number (Full-Time Equivalent = effort_hours / 128; 128 = 20 days * 8 hrs * 80% utilization)
 - effort_hours: number (TOTAL hours = sum of all task effort_hours for this feature)
 - effort_allocations: array derived from tasks, each with:
   - role: string
   - allocation_pct: number (percentage of this feature's effort by this role, must sum to 100)
   - effort_hours: number (hours for this role on this feature)
+  - fte: number (Full-Time Equivalent = effort_hours / 128; MUST be calculated for each role)
+
+## FTE Calculation (MANDATORY)
+FTE = effort_hours / 128
+Where 128 = working_days_per_month (20) × hours_per_day (8) × utilization_pct (80%).
+You MUST calculate and include fte for every task and every effort_allocation.
 
 ## Role Guidelines (AI Suggested Roles)
 Suggest the most appropriate role for each task. Use common delivery role names such as:
@@ -64,14 +87,14 @@ Assign exactly one role per task.
     "description": "Secure login, registration, and session management.",
     "priority": 1,
     "tasks": [
-      {"name": "Login/Register UI components", "effort_hours": 12, "role": "Developer"},
-      {"name": "Auth API with JWT", "effort_hours": 16, "role": "Developer"},
-      {"name": "Unit and integration tests", "effort_hours": 8, "role": "QA Engineer"}
+      {"name": "Login/Register UI components", "effort_hours": 12, "role": "Developer", "fte": 0.0938},
+      {"name": "Auth API with JWT", "effort_hours": 16, "role": "Developer", "fte": 0.125},
+      {"name": "Unit and integration tests", "effort_hours": 8, "role": "QA Engineer", "fte": 0.0625}
     ],
     "effort_hours": 36,
     "effort_allocations": [
-      {"role": "Developer", "allocation_pct": 77.8, "effort_hours": 28},
-      {"role": "QA Engineer", "allocation_pct": 22.2, "effort_hours": 8}
+      {"role": "Developer", "allocation_pct": 77.8, "effort_hours": 28, "fte": 0.2188},
+      {"role": "QA Engineer", "allocation_pct": 22.2, "effort_hours": 8, "fte": 0.0625}
     ]
   }
 ]
@@ -129,20 +152,34 @@ async def estimate_features_from_requirements(
             tasks_raw = item.get("tasks", [])
             tasks = []
             for t in tasks_raw:
+                hrs = Decimal(str(t.get("effort_hours", 0)))
+                task_fte = None
+                if "fte" in t and t.get("fte") is not None:
+                    task_fte = Decimal(str(t["fte"])).quantize(Decimal("0.0001"))
+                else:
+                    task_fte = compute_fte(hrs)
                 tasks.append(
                     FeatureTaskCreate(
                         name=str(t.get("name", "Unnamed"))[:500],
-                        effort_hours=Decimal(str(t.get("effort_hours", 0))),
+                        effort_hours=hrs,
                         role=sanitize_role(t.get("role", first_role)),
+                        fte=task_fte,
                     )
                 )
             allocations = []
             for a in item.get("effort_allocations", []):
+                alloc_hrs = Decimal(str(a.get("effort_hours", item.get("effort_hours", 0))))
+                alloc_fte = None
+                if "fte" in a and a.get("fte") is not None:
+                    alloc_fte = Decimal(str(a["fte"])).quantize(Decimal("0.0001"))
+                else:
+                    alloc_fte = compute_fte(alloc_hrs)
                 allocations.append(
                     EffortAllocationCreate(
                         role=sanitize_role(a.get("role", first_role)),
                         allocation_pct=Decimal(str(a.get("allocation_pct", 100))),
-                        effort_hours=Decimal(str(a.get("effort_hours", item.get("effort_hours", 0)))),
+                        effort_hours=alloc_hrs,
+                        fte=alloc_fte,
                     )
                 )
             if not allocations and tasks:
@@ -152,13 +189,22 @@ async def estimate_features_from_requirements(
                 total = sum(role_hours.values()) or Decimal(1)
                 for role, hrs in role_hours.items():
                     pct = (hrs / total * 100).quantize(Decimal("0.01"))
-                    allocations.append(EffortAllocationCreate(role=role, allocation_pct=pct, effort_hours=hrs))
+                    allocations.append(
+                        EffortAllocationCreate(
+                            role=role,
+                            allocation_pct=pct,
+                            effort_hours=hrs,
+                            fte=compute_fte(hrs),
+                        )
+                    )
             if not allocations:
+                item_hrs = Decimal(str(item.get("effort_hours", 0)))
                 allocations.append(
                     EffortAllocationCreate(
                         role=first_role,
                         allocation_pct=Decimal(100),
-                        effort_hours=Decimal(str(item.get("effort_hours", 0))),
+                        effort_hours=item_hrs,
+                        fte=compute_fte(item_hrs),
                     )
                 )
             features.append(
