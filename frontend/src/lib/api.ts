@@ -140,7 +140,7 @@ export const sprintPlanApi = {
     }),
 };
 
-export { fromApiRow };
+export { fromApiRow, toApiRow };
 
 export const repositoryApi = {
   list: (params?: { search?: string; status?: string }) => {
@@ -157,6 +157,8 @@ export const repositoryApi = {
 
 export const calculationsApi = {
   cost: (projectId: number) => api<CostBreakdown>(`/projects/${projectId}/calculations/cost`),
+  sprintPlanCost: (projectId: number) =>
+    api<SprintPlanCostBreakdown>(`/projects/${projectId}/calculations/sprint-plan-cost`),
   revenue: (projectId: number) => api<RevenueBreakdown>(`/projects/${projectId}/calculations/revenue`),
   profitability: (projectId: number) =>
     api<ProfitabilityBreakdown>(`/projects/${projectId}/calculations/profitability`),
@@ -371,6 +373,14 @@ export interface ReverseMarginResult {
   target_margin_pct: number;
   required_revenue: number;
   required_billing_rate?: number;
+}
+
+export interface SprintPlanCostBreakdown {
+  base_cost: number;
+  risk_buffer: number;
+  total_cost: number;
+  contingency_pct: number;
+  management_reserve_pct: number;
 }
 
 export interface TeamMember {

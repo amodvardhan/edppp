@@ -46,6 +46,7 @@ import {
   versionsApi,
   STATUS_TRANSITIONS,
   fromApiRow,
+  toApiRow,
   type TeamMemberCreate,
   type FeatureCreate,
   type Feature,
@@ -110,6 +111,7 @@ export default function ProjectDetail() {
   } | null>(null);
   const saveSprintPlanTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const saveFeaturesTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sprintPlanInitializedRef = React.useRef(false);
 
   const canEditTeam = hasRole("admin") || hasRole("delivery_manager");
   const canEditFeatures = hasRole("admin") || hasRole("delivery_manager") || hasRole("business_analyst");
@@ -162,6 +164,15 @@ export default function ProjectDetail() {
   });
 
   const {
+    data: sprintPlanCost,
+    isLoading: sprintPlanCostLoading,
+  } = useQuery({
+    queryKey: ["sprintPlanCost", projectId],
+    queryFn: () => calculationsApi.sprintPlanCost(projectId),
+    enabled: projectId > 0 && activeTab === "calculations",
+  });
+
+  const {
     data: sprint,
     isLoading: sprintLoading,
     isError: sprintError,
@@ -185,6 +196,8 @@ export default function ProjectDetail() {
     queryKey: ["sprintPlan", projectId],
     queryFn: () => sprintPlanApi.get(projectId),
     enabled: projectId > 0,
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
   });
 
   const { data: buRates = [] } = useQuery({
@@ -206,12 +219,77 @@ export default function ProjectDetail() {
         roles: data.roles,
       }),
     onSuccess: (saved) => {
-      queryClient.setQueryData(
-        ["sprintPlan", projectId],
-        saved
-      );
+      queryClient.setQueryData(["sprintPlan", projectId], saved);
+      queryClient.invalidateQueries({ queryKey: ["sprintPlanCost", projectId] });
     },
   });
+
+  useEffect(() => {
+    sprintPlanInitializedRef.current = false;
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!project || sprintPlanInitializedRef.current) return;
+    if (!sprintPlanApiData) return;
+    if (sprintPlanApiData.rows.length === 0) {
+      const teamRoles = team?.map((m) => m.role) ?? [];
+      if (teamRoles.length === 0) {
+        setSprintPlan(null);
+        sprintPlanInitializedRef.current = true;
+        return;
+      }
+      if (sprintLoading) return;
+      sprintPlanInitializedRef.current = true;
+      const numSprints = Math.max(CONFIG.minSprints, sprint?.sprints_required ?? CONFIG.minSprints);
+      const defaultRoles = buRates.map((r) => (r.role || "").trim()).filter(Boolean);
+      const { rows, roles } = createInitialSprintPlanning(
+        team ?? [],
+        project.sprint_duration_weeks ?? CONFIG.defaultSprintDurationWeeks,
+        numSprints,
+        defaultRoles
+      );
+      setSprintPlan({ rows, roles });
+      queryClient.setQueryData(["sprintPlan", projectId], { rows: rows.map(toApiRow), roles });
+      if (!(version?.is_locked ?? false)) {
+        saveSprintPlanMutation.mutate({ rows, roles });
+      }
+      return;
+    }
+    sprintPlanInitializedRef.current = true;
+    const apiRows = sprintPlanApiData.rows.map(fromApiRow);
+    const roleCapacity = computeRoleCapacity(team ?? []);
+    const migrated = migrateToSprintFormat(apiRows, sprintPlanApiData.roles, roleCapacity);
+    const hasSprintRows = migrated.some((r) => r.type === "sprint" || r.type === "sprint-week");
+    if (!hasSprintRows) {
+      const teamRoles = team?.map((m) => m.role) ?? [];
+      if (teamRoles.length === 0) {
+        setSprintPlan(null);
+        return;
+      }
+      if (sprintLoading) return;
+      const numSprints = Math.max(CONFIG.minSprints, sprint?.sprints_required ?? CONFIG.minSprints);
+      const defaultRoles = buRates.map((r) => (r.role || "").trim()).filter(Boolean);
+      const { rows, roles } = createInitialSprintPlanning(
+        team ?? [],
+        project.sprint_duration_weeks ?? CONFIG.defaultSprintDurationWeeks,
+        numSprints,
+        defaultRoles
+      );
+      setSprintPlan({ rows, roles });
+      queryClient.setQueryData(["sprintPlan", projectId], { rows: rows.map(toApiRow), roles });
+      if (!(version?.is_locked ?? false)) {
+        saveSprintPlanMutation.mutate({ rows, roles });
+      }
+      return;
+    }
+    const sorted = ensurePhasesAtEnd(migrated);
+    const needsMigration = apiRows.some((r) => r.type === "sprint-week" && r.weekNum != null);
+    setSprintPlan({ rows: sorted, roles: sprintPlanApiData.roles });
+    if (needsMigration && !(version?.is_locked ?? false)) {
+      queryClient.setQueryData(["sprintPlan", projectId], { rows: sorted.map(toApiRow), roles: sprintPlanApiData.roles });
+      saveSprintPlanMutation.mutate({ rows: sorted, roles: sprintPlanApiData.roles });
+    }
+  }, [project, sprintPlanApiData, team, sprint?.sprints_required, sprintLoading, version?.is_locked, buRates, projectId, queryClient, saveSprintPlanMutation]);
 
   const deleteProjectMutation = useMutation({
     mutationFn: () => projectsApi.delete(projectId),
@@ -221,7 +299,7 @@ export default function ProjectDetail() {
     },
   });
 
-  const calcLoading = costLoading || profitabilityLoading || sprintLoading;
+  const calcLoading = costLoading || profitabilityLoading || sprintLoading || sprintPlanCostLoading;
   const calcError = costError || profitabilityError || sprintError;
 
   const addMemberMutation = useMutation({
@@ -229,6 +307,7 @@ export default function ProjectDetail() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["team", projectId] });
       queryClient.invalidateQueries({ queryKey: ["sprintPlan", projectId] });
+      sprintPlanInitializedRef.current = false;
       setShowAddMember(false);
     },
   });
@@ -239,6 +318,7 @@ export default function ProjectDetail() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["team", projectId] });
       queryClient.invalidateQueries({ queryKey: ["sprintPlan", projectId] });
+      sprintPlanInitializedRef.current = false;
       setEditingMember(null);
     },
   });
@@ -248,6 +328,7 @@ export default function ProjectDetail() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["team", projectId] });
       queryClient.invalidateQueries({ queryKey: ["sprintPlan", projectId] });
+      sprintPlanInitializedRef.current = false;
     },
   });
 
@@ -275,79 +356,6 @@ export default function ProjectDetail() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["version", projectId] }),
   });
 
-  const lastProcessedRef = React.useRef<string | null>(null);
-  useEffect(() => {
-    lastProcessedRef.current = null;
-  }, [projectId]);
-
-  useEffect(() => {
-    if (!project || !sprintPlanApiData) return;
-    const cacheKey = JSON.stringify({
-      rows: sprintPlanApiData.rows.length,
-      roles: sprintPlanApiData.roles,
-    });
-    if (lastProcessedRef.current === cacheKey) return;
-    lastProcessedRef.current = cacheKey;
-
-    if (sprintPlanApiData.rows.length > 0) {
-      const apiRows = sprintPlanApiData.rows.map(fromApiRow);
-      const roleCapacity = computeRoleCapacity(team ?? []);
-      const migrated = migrateToSprintFormat(
-        apiRows,
-        sprintPlanApiData.roles,
-        roleCapacity
-      );
-      const hasSprintRows = migrated.some((r) => r.type === "sprint" || r.type === "sprint-week");
-      if (!hasSprintRows) {
-        const teamRoles = team?.map((m) => m.role) ?? [];
-        if (teamRoles.length > 0 && !sprintLoading) {
-          const numSprints = Math.max(CONFIG.minSprints, sprint?.sprints_required ?? CONFIG.minSprints);
-          const defaultRoles = buRates.map((r) => (r.role || "").trim()).filter(Boolean);
-          const { rows, roles } = createInitialSprintPlanning(
-            team ?? [],
-            project.sprint_duration_weeks ?? CONFIG.defaultSprintDurationWeeks,
-            numSprints,
-            defaultRoles
-          );
-          setSprintPlan({ rows, roles });
-          if (!(version?.is_locked ?? false)) {
-            saveSprintPlanMutation.mutate({ rows, roles });
-          }
-        } else {
-          setSprintPlan(null);
-        }
-        lastProcessedRef.current = null;
-        return;
-      }
-      const sorted = ensurePhasesAtEnd(migrated);
-      const needsMigration = apiRows.some((r) => r.type === "sprint-week" && r.weekNum != null);
-      setSprintPlan({
-        rows: sorted,
-        roles: sprintPlanApiData.roles,
-      });
-      if (needsMigration && !(version?.is_locked ?? false)) {
-        saveSprintPlanMutation.mutate({ rows: sorted, roles: sprintPlanApiData.roles });
-      }
-    } else {
-      const teamRoles = team?.map((m) => m.role) ?? [];
-      if (teamRoles.length === 0) {
-        setSprintPlan(null);
-        lastProcessedRef.current = null;
-        return;
-      }
-      if (sprintLoading) return;
-      const numSprints = Math.max(CONFIG.minSprints, sprint?.sprints_required ?? CONFIG.minSprints);
-      const defaultRoles = buRates.map((r) => (r.role || "").trim()).filter(Boolean);
-      const { rows, roles } = createInitialSprintPlanning(
-        team ?? [],
-        project.sprint_duration_weeks ?? CONFIG.defaultSprintDurationWeeks,
-        numSprints,
-        defaultRoles
-      );
-      setSprintPlan({ rows, roles });
-      saveSprintPlanMutation.mutate({ rows, roles });
-    }
-  }, [project, sprintPlanApiData, team, sprint?.sprints_required, sprintLoading, version?.is_locked, buRates]);
 
   const debouncedSaveSprintPlan = useCallback(
     (data: { rows: SprintPlanningRow[]; roles: string[] }) => {
@@ -357,7 +365,7 @@ export default function ProjectDetail() {
       saveSprintPlanTimeoutRef.current = setTimeout(() => {
         saveSprintPlanMutation.mutate(data);
         saveSprintPlanTimeoutRef.current = null;
-      }, 800);
+      }, 400);
     },
     [saveSprintPlanMutation]
   );
@@ -707,10 +715,11 @@ export default function ProjectDetail() {
               isLocked={isLocked}
               roleCapacity={computeRoleCapacity(team ?? [])}
               onRowsChange={(rows) => {
+                if (isLocked) return;
                 const sorted = ensurePhasesAtEnd(rows);
-                const next = { ...sprintPlan, rows: sorted };
+                const next = { rows: sorted, roles: sprintPlan.roles };
                 setSprintPlan(next);
-                if (!isLocked) debouncedSaveSprintPlan(next);
+                debouncedSaveSprintPlan(next);
               }}
               onRolesChange={undefined}
             />
@@ -746,7 +755,7 @@ export default function ProjectDetail() {
             </Box>
           ) : (
             <>
-              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "repeat(3, 1fr)" }, gap: 2, mb: 3 }}>
+              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "repeat(2, 1fr)", lg: "repeat(4, 1fr)" }, gap: 2, mb: 3 }}>
                 {cost && (
                   <Card sx={{ border: "1px solid", borderColor: "divider" }}>
                     <CardContent>
@@ -788,6 +797,23 @@ export default function ProjectDetail() {
                       </Typography>
                       <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
                         {profitability.margin_below_threshold ? "Below 15% — review recommended" : "Gross margin"}
+                      </Typography>
+                    </CardContent>
+                  </Card>
+                )}
+                {sprintPlanCost && (
+                  <Card sx={{ border: "1px solid", borderColor: "divider" }}>
+                    <CardContent>
+                      <Typography variant="overline" color="text.secondary" fontWeight={600}>
+                        Cost (from FTE)
+                      </Typography>
+                      <Typography variant="body2" sx={{ mt: 1 }}>Base: {formatCurrency(Number(sprintPlanCost.base_cost), currency)}</Typography>
+                      <Typography variant="body2">Buffer: {formatCurrency(Number(sprintPlanCost.risk_buffer), currency)}</Typography>
+                      <Typography variant="h6" fontWeight={600} sx={{ mt: 2 }}>
+                        {formatCurrency(Number(sprintPlanCost.total_cost), currency)}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
+                        From sprint plan allocation × rates
                       </Typography>
                     </CardContent>
                   </Card>

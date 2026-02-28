@@ -308,3 +308,51 @@ class CalculationEngine:
         if margin_pct is None:
             return False
         return margin_pct < Decimal(str(self.settings.margin_threshold_warning))
+
+    def sprint_plan_cost(
+        self,
+        sprint_plan_rows: list[dict],
+        team_members: list[TeamMember],
+        default_rates: dict[str, tuple[Decimal, Decimal]],
+        sprint_config: dict | None,
+        contingency_pct: Decimal = Decimal(0),
+        management_reserve_pct: Decimal = Decimal(0),
+    ) -> tuple[Decimal, Decimal, Decimal]:
+        """
+        Cost from sprint plan: FTE × cost_rate_per_day × duration_days per row.
+        Returns (base_cost, risk_buffer, total_cost).
+        """
+        if not sprint_config:
+            working_days = self.settings.default_working_days_per_month
+            duration_weeks = self.settings.default_sprint_duration_weeks
+        else:
+            working_days = sprint_config.get("working_days_per_month", 20)
+            duration_weeks = sprint_config.get("duration_weeks", 2)
+        days_per_sprint = Decimal(working_days * duration_weeks // 2)
+        if days_per_sprint <= 0:
+            days_per_sprint = Decimal(10)
+
+        role_to_rate: dict[str, Decimal] = {}
+        for m in team_members:
+            r = (m.role or "").strip()
+            if r and r not in role_to_rate:
+                role_to_rate[r] = _resolve_cost_rate_per_day(m, default_rates)
+        for role in set(k for row in sprint_plan_rows for k in (row.get("allocations") or {})):
+            if role and role not in role_to_rate:
+                rate, _ = _get_bu_rate_for_role(role, default_rates)
+                role_to_rate[role] = rate
+
+        total = Decimal(0)
+        for row in sprint_plan_rows:
+            allocations = row.get("allocations") or {}
+            row_type = row.get("row_type") or ""
+            if row_type == "phase":
+                days = days_per_sprint
+            else:
+                days = days_per_sprint
+            for role, fte in allocations.items():
+                rate = role_to_rate.get((role or "").strip(), Decimal(0))
+                fte_val = Decimal(str(fte)) if fte is not None else Decimal(0)
+                total += fte_val * rate * days
+        base = self._round(total)
+        return self.cost_with_buffers(base, contingency_pct, management_reserve_pct)

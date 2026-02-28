@@ -157,18 +157,23 @@ const EditableCell = memo(function EditableCell({
 }: EditableCellProps) {
   const [local, setLocal] = useState("");
   const [focused, setFocused] = useState(false);
+  const [pendingCommitted, setPendingCommitted] = useState<number | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const cellKey = `${rowId}:${role}`;
 
   useEffect(() => {
     if (!focused) {
-      setLocal(formatAllocation(value));
+      if (pendingCommitted !== null && value === pendingCommitted) {
+        setPendingCommitted(null);
+      }
+      setLocal(formatAllocation(pendingCommitted ?? value));
     }
-  }, [value, focused]);
+  }, [value, focused, pendingCommitted]);
 
   const handleFocus = useCallback(() => {
     setFocused(true);
+    setPendingCommitted(null);
     setLocal(value > 0 ? String(value) : "");
     requestAnimationFrame(() => inputRef.current?.select());
   }, [value]);
@@ -177,6 +182,7 @@ const EditableCell = memo(function EditableCell({
     setFocused(false);
     const parsed = parseAllocation(local);
     if (parsed !== value) {
+      setPendingCommitted(parsed);
       onChange(rowId, role, parsed);
     }
     setLocal(formatAllocation(parsed));
@@ -233,6 +239,7 @@ const EditableCell = memo(function EditableCell({
     );
   }
 
+  const displayValue = pendingCommitted ?? value;
   return (
     <TableCell
       align="center"
@@ -245,7 +252,7 @@ const EditableCell = memo(function EditableCell({
       }}
       onClick={handleFocus}
     >
-      {formatAllocation(value) || "0"}
+      {formatAllocation(displayValue) || "0"}
     </TableCell>
   );
 });
@@ -531,6 +538,45 @@ export default function SprintPlanningGrid({
                 }}
               >
                 Total
+              </TableCell>
+            </TableRow>
+            <TableRow sx={{ bgcolor: "action.hover" }}>
+              <TableCell
+                sx={{
+                  fontWeight: 600,
+                  fontSize: "0.75rem",
+                  color: "text.secondary",
+                  borderRight: "1px solid",
+                  borderColor: "divider",
+                }}
+              >
+                FTE (capacity)
+              </TableCell>
+              {roles.map((role) => (
+                <TableCell
+                  key={role}
+                  align="center"
+                  sx={{
+                    fontSize: "0.875rem",
+                    borderRight: "1px solid",
+                    borderColor: "divider",
+                    bgcolor: "action.selected",
+                  }}
+                >
+                  {formatAllocation(roleCapacity[role] ?? 0) || "0"}
+                </TableCell>
+              ))}
+              <TableCell
+                align="center"
+                sx={{
+                  fontWeight: 600,
+                  fontSize: "0.875rem",
+                  bgcolor: "action.selected",
+                }}
+              >
+                {formatAllocation(
+                  roles.reduce((s, r) => s + (roleCapacity[r] ?? 0), 0)
+                ) || "0"}
               </TableCell>
             </TableRow>
           </TableHead>

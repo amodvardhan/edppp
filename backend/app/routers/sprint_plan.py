@@ -101,9 +101,10 @@ async def save_sprint_plan(
             sprint_num=row.sprint_num,
             week_num=row.week_num,
             phase=row.phase,
-            allocations=row.values,
+            allocations=dict(row.values),
             sort_order=i,
         )
         db.add(db_row)
     await db.flush()
+    await db.commit()
     return SprintPlanSchema(rows=data.rows, roles=data.roles)

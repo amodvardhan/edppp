@@ -15,12 +15,14 @@ from app.models.feature import Feature
 from app.models.project import Project, ProjectVersion, RevenueModel
 from app.models.team import TeamMember
 from app.models.user import User
+from app.models.sprint_plan import SprintPlanRow
 from app.schemas.calculation import (
     CostBreakdown,
     ProfitabilityBreakdown,
     RevenueBreakdown,
     ReverseMarginResult,
     SprintAllocation,
+    SprintPlanCostBreakdown,
 )
 
 router = APIRouter(prefix="/projects", tags=["calculations"])
@@ -31,18 +33,21 @@ async def _get_default_rates(db: AsyncSession) -> dict[str, tuple[Decimal, Decim
     return {r.role.strip(): (r.cost_rate_per_day, r.billing_rate_per_day) for r in result.scalars().all()}
 
 
-async def _load_version_data(db: AsyncSession, project_id: int):
+async def _load_version_data(db: AsyncSession, project_id: int, with_sprint_plan: bool = False):
+    opts = [
+        selectinload(ProjectVersion.team_members),
+        selectinload(ProjectVersion.features).selectinload(Feature.effort_allocations),
+        selectinload(ProjectVersion.sprint_config),
+        selectinload(ProjectVersion.project),
+    ]
+    if with_sprint_plan:
+        opts.append(selectinload(ProjectVersion.sprint_plan_rows))
     result = await db.execute(
         select(ProjectVersion)
         .where(ProjectVersion.project_id == project_id)
         .order_by(ProjectVersion.version_number.desc())
         .limit(1)
-        .options(
-            selectinload(ProjectVersion.team_members),
-            selectinload(ProjectVersion.features).selectinload(Feature.effort_allocations),
-            selectinload(ProjectVersion.sprint_config),
-            selectinload(ProjectVersion.project),
-        )
+        .options(*opts)
     )
     version = result.scalar_one_or_none()
     if not version:
@@ -228,4 +233,41 @@ async def reverse_margin(
         target_margin_pct=target_margin_pct,
         required_revenue=required_revenue,
         required_billing_rate=required_billing,
+    )
+
+
+@router.get("/{project_id}/calculations/sprint-plan-cost", response_model=SprintPlanCostBreakdown)
+async def get_sprint_plan_cost(
+    project_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(get_current_user)],
+):
+    """Cost from sprint plan allocation: FTE × rate × duration per row."""
+    version, project = await _load_version_data(db, project_id, with_sprint_plan=True)
+    default_rates = await _get_default_rates(db)
+    engine = CalculationEngine()
+    sprint_config = None
+    if version.sprint_config:
+        sprint_config = {
+            "working_days_per_month": version.sprint_config.working_days_per_month,
+            "duration_weeks": version.sprint_config.duration_weeks,
+        }
+    rows = [
+        {"row_type": r.row_type, "allocations": r.allocations or {}}
+        for r in sorted(version.sprint_plan_rows, key=lambda x: x.sort_order)
+    ]
+    base, buffer, total = engine.sprint_plan_cost(
+        rows,
+        list(version.team_members),
+        default_rates,
+        sprint_config,
+        version.contingency_pct or Decimal(0),
+        version.management_reserve_pct or Decimal(0),
+    )
+    return SprintPlanCostBreakdown(
+        base_cost=base,
+        risk_buffer=buffer,
+        total_cost=total,
+        contingency_pct=version.contingency_pct,
+        management_reserve_pct=version.management_reserve_pct,
     )

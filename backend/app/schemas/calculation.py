@@ -36,3 +36,12 @@ class ReverseMarginResult(BaseModel):
     target_margin_pct: Decimal
     required_revenue: Decimal
     required_billing_rate: Decimal | None
+
+
+class SprintPlanCostBreakdown(BaseModel):
+    """Cost from sprint plan allocation (FTE × rate × duration)."""
+    base_cost: Decimal
+    risk_buffer: Decimal
+    total_cost: Decimal
+    contingency_pct: Decimal
+    management_reserve_pct: Decimal
